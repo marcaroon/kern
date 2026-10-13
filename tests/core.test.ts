@@ -71,6 +71,8 @@ describe("exact rupiah and validated intent", () => {
     vi.stubEnv("OPENAI_MODEL", "");
     vi.stubEnv("ANTHROPIC_API_KEY", "");
     vi.stubEnv("ANTHROPIC_MODEL", "");
+    vi.stubEnv("GEMINI_API_KEY", "");
+    vi.stubEnv("GEMINI_MODEL", "");
     expect((await interpret("Bantuan", now)).intent).toBe("help");
     expect((await interpret("/start", now)).intent).toBe("help");
     expect((await interpret("/help@kern_bot", now)).intent).toBe("help");

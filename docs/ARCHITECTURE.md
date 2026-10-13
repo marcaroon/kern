@@ -1,6 +1,6 @@
 # Architecture
 
-Next.js 16 App Router / React / strict TypeScript serve the private dashboard and thin HTTP routes. Controllers authenticate/authorize and validate HTTP boundaries. Domain services own all business rules and Prisma transactions. Integrations are isolated adapters for Telegram, OpenAI/Anthropic and Google. n8n only schedules authenticated backend calls.
+Next.js 16 App Router / React / strict TypeScript serve the private dashboard and thin HTTP routes. Controllers authenticate/authorize and validate HTTP boundaries. Domain services own all business rules and Prisma transactions. Integrations are isolated adapters for Telegram, OpenAI/Anthropic/Gemini and Google Sheets. n8n only schedules authenticated backend calls.
 
 PostgreSQL is authoritative. Monetary amounts are positive BIGINT values with type income/expense/transfer, returned as decimal strings. No floating-point amount conversion. Supabase Auth is verified server-side with `getUser`, then compared with the configured owner UUID. Every personal query is owner scoped. Browser API access to application tables is denied by RLS (no public policies); only the server's database role accesses them.
 
@@ -26,7 +26,7 @@ Account, Transaction, Budget, BudgetAlert, Task, Reminder and Note hold personal
 ## Privacy and retention
 
 - Telegram receives incoming/outgoing chat text and the owner's Telegram user ID.
-- The AI provider (OpenAI or Anthropic) receives only the current message and current local date/time instructions. OpenAI requests use `store:false`. KERN does not send the database or history; provider account retention policies still apply.
+- The AI provider (OpenAI, Anthropic or Gemini) receives only the current message and current local date/time instructions. OpenAI requests use `store:false`. Gemini's free tier may use that text to improve Google's products. KERN does not send the database or history; provider account retention policies still apply.
 - Google receives synchronized transaction columns, including descriptions/account names.
 - Supabase/hosting hold personal data and server secrets; n8n holds its dedicated internal API credential and scheduler logs. Restrict n8n execution logging and operator access.
 - Processed inbox content and completed outbound content are redacted after 30 days by maintenance; IDs remain for replay protection. Old confirmation payloads are deleted. Failed/pending job payloads remain for recovery and should be reviewed periodically. Financial records and audit history persist until the owner follows an explicit deletion/export procedure; no automated financial deletion.

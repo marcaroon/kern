@@ -4,7 +4,7 @@ Private, Telegram-first Personal Intelligence System. Bahasa Indonesia, WIB, IDR
 
 ## Run locally
 
-Requirements: Node.js 22.12+ (tested with 22.23.1), npm, a Supabase project with PostgreSQL and one Auth user. Optional: a Telegram bot, OpenAI or Anthropic, Google Sheets, n8n. No live credentials are included. Without Supabase configuration the app shows a setup message; it does **not** expose a fake logged-in dashboard.
+Requirements: Node.js 22.12+ (tested with 22.23.1), npm, a Supabase project with PostgreSQL and one Auth user. Optional: a Telegram bot, OpenAI, Anthropic or Gemini, Google Sheets, n8n. No live credentials are included. Without Supabase configuration the app shows a setup message; it does **not** expose a fake logged-in dashboard.
 
 From PowerShell in this folder:
 
@@ -51,7 +51,7 @@ The local worker polls Telegram and processes inbox, reminders, outbound message
 - Task creation/edit/completion/cancellation with priority and due dates; searchable editable/archiveable notes.
 - One-time/daily/weekly/monthly reminders, original-day monthly clamping, one-occurrence catch-up, generation-based cancellation and persistent delivery status.
 - Telegram polling (or secret-token webhook), explicit user-ID allowlist for private chats, durable message deduplication and atomic domain action + reply enqueue.
-- Official OpenAI or Anthropic SDK with schema-constrained structured output, business validation, confidence gating, expiring confirmations, and a small deterministic fallback.
+- Official OpenAI, Anthropic or Google Gemini SDK with schema-constrained structured output, business validation, confidence gating, expiring confirmations, and a small deterministic fallback.
 - Transactional Sheets outbox, stable row reservations, RAW writes, verification, bounded retries and manual recovery.
 - Authenticated Supabase dashboard and APIs; no browser database credentials; RLS enabled without public policies on application tables.
 - Importable n8n workflows for dispatcher, daily briefing, weekly review, Sheets, optional daily recap and content retention.
