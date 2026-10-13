@@ -7,7 +7,7 @@ KERN uses the official [Telegram Bot API](https://core.telegram.org/bots/api). T
 1. In Telegram, open **@BotFather**, send `/newbot`, choose a display name and a username ending in `bot`.
 2. Put the token in `.env` as `TELEGRAM_BOT_TOKEN`. Treat it like a password; anyone with it controls the bot. Revoke it with `/revoke` in BotFather if it leaks.
 3. Open your bot and press **Start** (a bot cannot message a user who never started it).
-4. Find your numeric Telegram user ID (for example from the `from.id` of your `/start` update) and set `TELEGRAM_OWNER_USER_ID`. A comma-separated allowlist is supported; the first ID receives reports and reminders. Usernames and phone numbers are not used for authorization.
+4. Find your numeric Telegram user ID and set `TELEGRAM_OWNER_USER_ID`. While it is empty, KERN runs in setup mode: it replies to each private sender with their own numeric ID and stores nothing. Locally, `npm run telegram -- id` lists pending senders' IDs. A comma-separated allowlist is supported; the first ID receives reports and reminders. Usernames and phone numbers are not used for authorization.
 
 Only private chats from an allowlisted, non-bot user enter the inbox. Group messages, other users and bots are ignored without storing content.
 
@@ -15,7 +15,7 @@ Only private chats from an allowlisted, non-bot user enter the inbox. Group mess
 
 **Polling (default, `TELEGRAM_MODE=polling`)**: `npm run worker` calls `getUpdates` every cycle. No public URL, tunnel or webhook is needed. Updates are confirmed (next `offset`) only after they are committed to the inbox, so a crash redelivers them and the stable inbox ID `tg:<chat>:<message_id>` prevents duplicate actions. Polling fails with `TELEGRAM_WEBHOOK_ACTIVE` while a webhook is registered; remove it with `deleteWebhook`.
 
-**Webhook (optional, for hosted deployments, `TELEGRAM_MODE=webhook`)**: set `TELEGRAM_WEBHOOK_SECRET` (at least 32 random characters, letters/digits/`_`/`-`) and register `https://YOUR_HOST/api/webhooks/telegram` with `setWebhook` including the same `secret_token`. KERN compares the `X-Telegram-Bot-Api-Secret-Token` header in constant time before reading the body. In polling mode the route answers 404.
+**Webhook (hosted deployments, `TELEGRAM_MODE=webhook`; the default on Vercel)**: set `TELEGRAM_WEBHOOK_SECRET` (at least 32 random characters, letters/digits/`_`/`-`) and register `https://YOUR_HOST/api/webhooks/telegram` with `setWebhook` including the same `secret_token`. KERN compares the `X-Telegram-Bot-Api-Secret-Token` header in constant time before reading the body. In polling mode the route answers 404. After storing a message the webhook request immediately executes it and sends the reply; if that fails, the stored message is picked up by the next scheduled `tick`. Register the webhook with `npm run telegram -- webhook` (uses `NEXT_PUBLIC_APP_URL` and the secret) or the browser URL in the Indonesian guide. Switch back with `npm run telegram -- polling`.
 
 ## Keep the worker running on Windows
 

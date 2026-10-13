@@ -22,7 +22,41 @@ const envelope = z.object({
 });
 export type TelegramUpdate = z.infer<typeof updateSchema>;
 export function telegramMode() {
-  return process.env.TELEGRAM_MODE === "webhook" ? "webhook" : "polling";
+  const mode = process.env.TELEGRAM_MODE;
+  if (mode === "webhook" || mode === "polling") return mode;
+  // Vercel has no resident worker to poll, so it defaults to webhook delivery.
+  return process.env.VERCEL ? "webhook" : "polling";
+}
+// Setup mode: until an allowlist exists, tell each private sender their own numeric ID
+// (and nothing else) so the owner can configure TELEGRAM_OWNER_USER_ID without tools.
+export async function setupReplies(
+  raw: unknown[],
+  allowed: string[],
+  transport: typeof fetch = fetch,
+) {
+  if (allowed.length || !configured("TELEGRAM_BOT_TOKEN")) return 0;
+  let sent = 0;
+  for (const item of raw) {
+    const message = updateSchema.safeParse(item).data?.message;
+    if (
+      message?.chat.type !== "private" ||
+      !message.from ||
+      message.from.is_bot ||
+      message.from.id !== message.chat.id
+    )
+      continue;
+    await call(
+      "sendMessage",
+      {
+        chat_id: message.chat.id,
+        text: `KERN belum dikonfigurasi. ID Telegram kamu: ${message.from.id}\nIsi TELEGRAM_OWNER_USER_ID dengan angka ini, lalu deploy ulang.`,
+      },
+      transport,
+      15000,
+    ).catch(() => undefined);
+    sent++;
+  }
+  return sent;
 }
 // Inbox IDs are stable per chat message, so a redelivered update never repeats an action.
 export function inboxId(chatId: number, messageId: number) {
@@ -119,6 +153,7 @@ export async function pollUpdates(
     allowedTelegramIds(),
     now,
   );
+  await setupReplies(updates, allowedTelegramIds(), transport);
   // Confirm only after the inbox commit; a crash before this point redelivers safely.
   const last = Math.max(
     ...updates.map(

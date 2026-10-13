@@ -34,6 +34,43 @@ export async function automate(
         messages: await dispatchMessages(database, telegramSender(), now),
       };
     }
+    case "reply":
+      // Webhook mode: answer stored messages within the same request (no resident worker).
+      return {
+        inbox: await processInbox(database, now, zone),
+        messages: await dispatchMessages(database, telegramSender(), now),
+      };
+    case "tick": {
+      // One external per-minute scheduler call drives everything on serverless hosts.
+      // Reports run in a window so a late or skipped minute still fires once; their
+      // job keys are per period, so repeated calls inside the window enqueue nothing new.
+      const c = config(),
+        local = DateTime.fromJSDate(now).setZone(zone);
+      const inWindow = (time: string) => {
+        const [hour, minute] = time.split(":").map(Number);
+        const minutes = local
+          .diff(local.set({ hour, minute, second: 0, millisecond: 0 }))
+          .as("minutes");
+        return minutes >= 0 && minutes < 15;
+      };
+      const step = (op: string) =>
+        automate(database, op, now).catch((error) => ({
+          error: safeCode(error),
+        }));
+      const result: Record<string, unknown> = {};
+      if (inWindow(c.KERN_DAILY_BRIEFING_TIME))
+        result.daily = await step("daily");
+      if (
+        local.setLocale("en").weekdayLong?.toUpperCase() ===
+          c.KERN_WEEKLY_REVIEW_DAY &&
+        inWindow(c.KERN_WEEKLY_REVIEW_TIME)
+      )
+        result.weekly = await step("weekly");
+      if (inWindow("03:00")) result.maintenance = await step("maintenance");
+      result.dispatch = await step("dispatch");
+      result.sheets = await step("sheets");
+      return result;
+    }
     case "sheets":
       return syncSheets(database, now);
     case "daily":

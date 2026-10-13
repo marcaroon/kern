@@ -138,6 +138,18 @@ describe("security boundaries and honest delivery", () => {
       ),
     ).toThrow();
   });
+  it("accepts the Vercel production origin when no app URL is configured", () => {
+    vi.stubEnv("NEXT_PUBLIC_APP_URL", "");
+    vi.stubEnv("VERCEL_PROJECT_PRODUCTION_URL", "kern-test.vercel.app");
+    const from = (origin: string) =>
+      new Request("https://kern-test.vercel.app/api/tasks", {
+        headers: { origin },
+      });
+    expect(() =>
+      assertOrigin(from("https://kern-test.vercel.app")),
+    ).not.toThrow();
+    expect(() => assertOrigin(from("https://other.vercel.app"))).toThrow();
+  });
   it("limits request bytes including missing Content-Length", async () => {
     await expect(
       readBody(
@@ -173,5 +185,29 @@ describe("security boundaries and honest delivery", () => {
         })
       ).status,
     ).toBe(403);
+  });
+});
+describe("database connection options", () => {
+  it("uses an inline CA with full verification and drops URL SSL overrides", async () => {
+    const { connectionOptions } = await import("@/lib/db");
+    vi.stubEnv(
+      "DATABASE_URL",
+      "postgresql://u:p@h.example:6543/postgres?sslmode=verify-full&sslrootcert=C:/x.crt&pgbouncer=true",
+    );
+    vi.stubEnv(
+      "DATABASE_CA_CERT",
+      "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----",
+    );
+    const options = connectionOptions();
+    expect(options.ssl).toEqual({
+      ca: "-----BEGIN CERTIFICATE-----\nabc\n-----END CERTIFICATE-----",
+      rejectUnauthorized: true,
+    });
+    expect(options.connectionString).not.toMatch(/sslmode|sslrootcert/);
+    expect(options.connectionString).toContain("pgbouncer=true");
+    vi.stubEnv("DATABASE_CA_CERT", "");
+    expect(connectionOptions()).toEqual({
+      connectionString: expect.stringContaining("sslrootcert"),
+    });
   });
 });

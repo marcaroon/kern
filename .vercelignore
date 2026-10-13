@@ -1,0 +1,11 @@
+# Never upload local secrets or machine state with `vercel deploy`.
+.env
+.env.*
+!.env.example
+.local/
+node_modules/
+.next/
+src/generated/
+coverage/
+test-results/
+*.tsbuildinfo

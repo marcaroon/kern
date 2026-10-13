@@ -2,6 +2,12 @@
 
 Private, Telegram-first Personal Intelligence System. Bahasa Indonesia, WIB, IDR. A real database-backed application: transactions, budgets, tasks, persistent reminders, notes, reports, owner-only dashboard, and recoverable integration queues.
 
+## Deploy (always online)
+
+KERN runs free on Vercel (app, Telegram webhook) + Supabase (database) + cron-job.org (one per-minute `POST /api/internal/tick` with the internal Bearer secret for reminders, reports, retries, Sheets and maintenance). On Vercel the Telegram mode defaults to webhook, the dashboard origin comes from `VERCEL_PROJECT_PRODUCTION_URL`, `vercel-build` applies pending migrations when `DIRECT_URL` is set, and `DATABASE_CA_CERT` carries the Supabase CA so certificate verification stays on without a local file. Use the Supabase transaction pooler (port 6543) for `DATABASE_URL` and the session pooler for `DIRECT_URL`.
+
+Step-by-step guide for installing your own copy (Bahasa Indonesia, no local tools needed): [docs/PANDUAN_PASANG_SENDIRI.md](docs/PANDUAN_PASANG_SENDIRI.md). Each person runs a separate copy with their own accounts; KERN is single-owner and does not share data between users.
+
 ## Run locally
 
 Requirements: Node.js 22.12+ (tested with 22.23.1), npm, a Supabase project with PostgreSQL and one Auth user. Optional: a Telegram bot, OpenAI, Anthropic or Gemini, Google Sheets, n8n. No live credentials are included. Without Supabase configuration the app shows a setup message; it does **not** expose a fake logged-in dashboard.
@@ -27,23 +33,24 @@ The local worker polls Telegram and processes inbox, reminders, outbound message
 
 ## Commands
 
-| Command                                   | Purpose                                                                                                  |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `npm run dev`                             | Next development server                                                                                  |
-| `npm run db:generate`                     | Generate Prisma client                                                                                   |
-| `npm run db:migrate`                      | Apply checked-in migrations using DIRECT_URL                                                             |
-| `npm run db:dev -- --name change_name`    | Author a migration against a disposable development database                                             |
-| `npm run db:seed`                         | Explicitly opted-in, labelled demo task/note seed; requires a separate database with `demo` in its name  |
-| `npm run sheets:init`                     | Initialize and verify headers on an existing empty Transactions worksheet                                |
-| `npm run worker`                          | Local persistent queue worker (uses actual configured integrations)                                      |
-| `scripts/windows/install-worker-task.ps1` | Start the worker hidden at Windows logon with automatic restart (`-Uninstall` removes it)                |
-| `npm run test:migrations`                 | Deploy migrations twice and check schema drift on an isolated embedded PostgreSQL database               |
-| `npm run test:ui`                         | Chromium smoke checks with explicit synthetic UI fixtures (first run: `npx playwright install chromium`) |
-| `npm test`                                | Credential-free Vitest suite with isolated embedded PostgreSQL                                           |
-| `npm run lint`                            | ESLint                                                                                                   |
-| `npm run typecheck`                       | Strict TypeScript                                                                                        |
-| `npm run format:check`                    | Prettier                                                                                                 |
-| `npm run build` / `npm start`             | Production build / server                                                                                |
+| Command                                           | Purpose                                                                                                                |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `npm run dev`                                     | Next development server                                                                                                |
+| `npm run db:generate`                             | Generate Prisma client                                                                                                 |
+| `npm run db:migrate`                              | Apply checked-in migrations using DIRECT_URL                                                                           |
+| `npm run db:dev -- --name change_name`            | Author a migration against a disposable development database                                                           |
+| `npm run db:seed`                                 | Explicitly opted-in, labelled demo task/note seed; requires a separate database with `demo` in its name                |
+| `npm run sheets:init`                             | Initialize and verify headers on an existing empty Transactions worksheet                                              |
+| `npm run telegram -- <id/webhook/polling/status>` | Show sender IDs, register the production webhook (uses NEXT_PUBLIC_APP_URL), return to polling, or inspect the webhook |
+| `npm run worker`                                  | Local persistent queue worker (uses actual configured integrations)                                                    |
+| `scripts/windows/install-worker-task.ps1`         | Start the worker hidden at Windows logon with automatic restart (`-Uninstall` removes it)                              |
+| `npm run test:migrations`                         | Deploy migrations twice and check schema drift on an isolated embedded PostgreSQL database                             |
+| `npm run test:ui`                                 | Chromium smoke checks with explicit synthetic UI fixtures (first run: `npx playwright install chromium`)               |
+| `npm test`                                        | Credential-free Vitest suite with isolated embedded PostgreSQL                                                         |
+| `npm run lint`                                    | ESLint                                                                                                                 |
+| `npm run typecheck`                               | Strict TypeScript                                                                                                      |
+| `npm run format:check`                            | Prettier                                                                                                               |
+| `npm run build` / `npm start`                     | Production build / server                                                                                              |
 
 ## Implemented behavior
 

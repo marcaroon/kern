@@ -25,7 +25,11 @@ export function assertInternal(
 }
 export function assertOrigin(request: Request) {
   const expected = new URL(
-    process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000",
+    process.env.NEXT_PUBLIC_APP_URL ||
+      // Vercel provides the production domain, so hosted copies need no extra setting.
+      (process.env.VERCEL_PROJECT_PRODUCTION_URL
+        ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
+        : "http://localhost:3000"),
   ).origin;
   if (request.headers.get("origin") !== expected)
     throw new AppError("INVALID_ORIGIN", 403);

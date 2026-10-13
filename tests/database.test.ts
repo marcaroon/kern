@@ -31,6 +31,8 @@ vi.mock("@/lib/auth", () => ({
   requireOwner: async () => "11111111-1111-4111-8111-111111111111",
 }));
 import { handleApi } from "@/controllers/api";
+import { receiveTelegram } from "@/controllers/webhook";
+import { automate } from "@/services/automation";
 
 const owner = "11111111-1111-4111-8111-111111111111";
 const now = new Date("2026-10-12T01:00:00Z");
@@ -562,6 +564,97 @@ describe("Google Sheets outbox under partial failure", () => {
     expect((await db.sheetSyncOutbox.findFirstOrThrow()).status).toBe(
       "pending",
     );
+    vi.unstubAllEnvs();
+  });
+});
+describe("serverless webhook and scheduler", () => {
+  const secret = "s".repeat(32);
+  function hosted() {
+    vi.stubEnv("TELEGRAM_MODE", "webhook");
+    vi.stubEnv("TELEGRAM_WEBHOOK_SECRET", secret);
+    vi.stubEnv("TELEGRAM_BOT_TOKEN", "test-only");
+    vi.stubEnv("TELEGRAM_OWNER_USER_ID", String(ownerChat));
+    vi.stubEnv("KERN_OWNER_SUPABASE_USER_ID", owner);
+    for (const name of [
+      "AI_PROVIDER",
+      "OPENAI_API_KEY",
+      "ANTHROPIC_API_KEY",
+      "GEMINI_API_KEY",
+    ])
+      vi.stubEnv(name, "");
+  }
+  it("stores, executes and answers a webhook message in the same request", async () => {
+    hosted();
+    const sent = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ ok: true, result: { message_id: 9 } })),
+    );
+    vi.stubGlobal("fetch", sent);
+    const post = () =>
+      receiveTelegram(
+        new Request("http://localhost/api/webhooks/telegram", {
+          method: "POST",
+          headers: { "X-Telegram-Bot-Api-Secret-Token": secret },
+          body: JSON.stringify(update(40)),
+        }),
+      );
+    expect((await post()).status).toBe(200);
+    expect(await db.transaction.count()).toBe(1);
+    expect((await db.job.findFirstOrThrow()).status).toBe("accepted");
+    expect(sent).toHaveBeenCalledTimes(1);
+    // Telegram redelivering the same update repeats neither the action nor the reply.
+    expect((await post()).status).toBe(200);
+    expect(await db.transaction.count()).toBe(1);
+    expect(sent).toHaveBeenCalledTimes(1);
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+  it("keeps the message for the scheduler when the reply cannot be processed", async () => {
+    hosted();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network down");
+      }),
+    );
+    const response = await receiveTelegram(
+      new Request("http://localhost/api/webhooks/telegram", {
+        method: "POST",
+        headers: { "X-Telegram-Bot-Api-Secret-Token": secret },
+        body: JSON.stringify(update(41)),
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await db.transaction.count()).toBe(1);
+    expect((await db.job.findFirstOrThrow()).status).toBe("uncertain");
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+  it("fires daily and weekly reports once inside their WIB windows", async () => {
+    hosted();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("{}", { status: 503 })),
+    );
+    // Sunday 18 October 2026, WIB = UTC+7.
+    const at = (hhmm: string) => new Date(`2026-10-18T${hhmm}:00+07:00`);
+    const reports = () =>
+      db.job.count({ where: { key: { startsWith: "report:" } } });
+    await automate(db, "tick", at("06:59"));
+    expect(await reports()).toBe(0);
+    await automate(db, "tick", at("07:00"));
+    await automate(db, "tick", at("07:14"));
+    expect(await reports()).toBe(1);
+    await automate(db, "tick", at("07:15"));
+    expect(await reports()).toBe(1);
+    await automate(db, "tick", at("20:03"));
+    await automate(db, "tick", at("20:04"));
+    expect(await reports()).toBe(2);
+    const keys = (await db.job.findMany({ select: { key: true } })).map(
+      (j) => j.key,
+    );
+    expect(keys.some((k) => k.includes(":weekly:"))).toBe(true);
+    vi.unstubAllGlobals();
     vi.unstubAllEnvs();
   });
 });

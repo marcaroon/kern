@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "prisma generate && next build",
+    "vercel-build": "prisma generate && node scripts/migrate-deploy.mjs && next build",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "prisma generate && next typegen && tsc --noEmit",
@@ -19,6 +20,7 @@
     "db:seed": "tsx prisma/seed.ts",
     "sheets:init": "tsx scripts/init-sheets.ts",
     "worker": "tsx scripts/worker.ts",
+    "telegram": "tsx scripts/telegram.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "pretest": "prisma generate",

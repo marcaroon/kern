@@ -8,6 +8,25 @@ const schema = z.object({
   KERN_OWNER_SUPABASE_USER_ID: z.string().uuid().optional(),
   KERN_INTERNAL_API_SECRET: z.string().min(32).optional(),
   KERN_LOG_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(30),
+  KERN_DAILY_BRIEFING_TIME: z
+    .string()
+    .regex(/^([01]\d|2[0-3]):[0-5]\d$/)
+    .default("07:00"),
+  KERN_WEEKLY_REVIEW_DAY: z
+    .enum([
+      "MONDAY",
+      "TUESDAY",
+      "WEDNESDAY",
+      "THURSDAY",
+      "FRIDAY",
+      "SATURDAY",
+      "SUNDAY",
+    ])
+    .default("SUNDAY"),
+  KERN_WEEKLY_REVIEW_TIME: z
+    .string()
+    .regex(/^([01]\d|2[0-3]):[0-5]\d$/)
+    .default("20:00"),
 });
 export function config() {
   return schema.parse(

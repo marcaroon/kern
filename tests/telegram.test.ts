@@ -1,5 +1,9 @@
 import { it, expect, vi, afterEach, beforeEach } from "vitest";
-import { telegramSender } from "@/integrations/telegram";
+import {
+  setupReplies,
+  telegramMode,
+  telegramSender,
+} from "@/integrations/telegram";
 import { DeliveryError } from "@/services/queue";
 beforeEach(() => {
   vi.stubEnv("TELEGRAM_BOT_TOKEN", "123:secret-token");
@@ -76,4 +80,43 @@ it("maps provider outcomes to honest retry dispositions", async () => {
     "TELEGRAM_SEND_UNCERTAIN",
     "uncertain",
   ]);
+});
+it("defaults to webhook on Vercel and honours an explicit mode", () => {
+  vi.stubEnv("TELEGRAM_MODE", "");
+  vi.stubEnv("VERCEL", "");
+  expect(telegramMode()).toBe("polling");
+  vi.stubEnv("VERCEL", "1");
+  expect(telegramMode()).toBe("webhook");
+  vi.stubEnv("TELEGRAM_MODE", "polling");
+  expect(telegramMode()).toBe("polling");
+});
+it("tells private senders their own ID only while no owner is configured", async () => {
+  const transport = reply(200, { ok: true, result: { message_id: 1 } });
+  const message = (id: number, type = "private", isBot = false) => ({
+    update_id: id,
+    message: {
+      message_id: 1,
+      date: 1,
+      chat: { id: type === "private" ? id : -100, type },
+      from: { id, is_bot: isBot },
+      text: "/start",
+    },
+  });
+  const updates = [
+    message(555),
+    message(556, "group"),
+    message(557, "private", true),
+  ];
+  expect(
+    await setupReplies(updates, [], transport as unknown as typeof fetch),
+  ).toBe(1);
+  const body = JSON.parse(
+    String(((transport.mock.calls[0] as unknown[])[1] as RequestInit).body),
+  );
+  expect(body.chat_id).toBe(555);
+  expect(body.text).toContain("555");
+  expect(
+    await setupReplies(updates, ["1001"], transport as unknown as typeof fetch),
+  ).toBe(0);
+  expect(transport).toHaveBeenCalledTimes(1);
 });
