@@ -31,9 +31,15 @@ export async function integrationHealth(database: Database, ownerId: string) {
       select: { id: true, status: true, attempts: true, lastError: true },
     }),
   ]);
+  const tick = await database.heartbeat.findUnique({ where: { name: "tick" } });
+  // The external cron calls tick every minute; allow for a couple of missed runs.
+  const schedulerRunning =
+    !!tick && Date.now() - tick.at.getTime() < 3 * 60 * 1000;
   return {
     database: "connected",
+    schedulerLastRunAt: tick?.at ?? null,
     integrations: {
+      scheduler: schedulerRunning ? "berjalan" : false,
       telegram:
         configured("TELEGRAM_BOT_TOKEN") && allowedTelegramIds().length > 0
           ? telegramMode()

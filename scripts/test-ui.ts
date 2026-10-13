@@ -104,7 +104,9 @@ const fixtures: Record<string, unknown> = {
   accounts: { rows: [] },
   health: {
     database: "connected",
+    schedulerLastRunAt: null,
     integrations: {
+      scheduler: false,
       telegram: false,
       ai: false,
       sheets: false,

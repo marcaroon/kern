@@ -69,6 +69,12 @@ export async function automate(
       if (inWindow("03:00")) result.maintenance = await step("maintenance");
       result.dispatch = await step("dispatch");
       result.sheets = await step("sheets");
+      // Lets the dashboard show whether the external scheduler is actually running.
+      await database.heartbeat.upsert({
+        where: { name: "tick" },
+        create: { name: "tick", at: now },
+        update: { at: now },
+      });
       return result;
     }
     case "sheets":

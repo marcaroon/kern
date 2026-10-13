@@ -1162,11 +1162,17 @@ function Settings() {
                 <span className="badge">
                   {key === "Database"
                     ? "Terhubung"
-                    : typeof configured === "string"
-                      ? `Terkonfigurasi (${configured})`
-                      : configured
-                        ? "Terkonfigurasi"
-                        : "Belum diatur"}
+                    : key === "scheduler"
+                      ? configured
+                        ? "Berjalan"
+                        : data.schedulerLastRunAt
+                          ? `Terhenti sejak ${new Date(data.schedulerLastRunAt).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })}`
+                          : "Belum pernah berjalan"
+                      : typeof configured === "string"
+                        ? `Terkonfigurasi (${configured})`
+                        : configured
+                          ? "Terkonfigurasi"
+                          : "Belum diatur"}
                 </span>
               </div>
             ),

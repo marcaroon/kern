@@ -33,6 +33,7 @@ vi.mock("@/lib/auth", () => ({
 import { handleApi } from "@/controllers/api";
 import { receiveTelegram } from "@/controllers/webhook";
 import { automate } from "@/services/automation";
+import { integrationHealth } from "@/services/health";
 
 const owner = "11111111-1111-4111-8111-111111111111";
 const now = new Date("2026-10-12T01:00:00Z");
@@ -63,7 +64,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await db.$executeRawUnsafe(
-    'TRUNCATE "AuditLog", "BudgetAlert", "Budget", "SheetSyncOutbox", "Transaction", "Account", "Reminder", "Task", "Note", "PendingAction", "Job", "InboxMessage" RESTART IDENTITY CASCADE',
+    'TRUNCATE "AuditLog", "BudgetAlert", "Budget", "SheetSyncOutbox", "Transaction", "Account", "Reminder", "Task", "Note", "PendingAction", "Job", "InboxMessage", "Heartbeat" RESTART IDENTITY CASCADE',
   );
 });
 const transaction = (amount = "35000") => ({
@@ -650,11 +651,28 @@ describe("serverless webhook and scheduler", () => {
     await automate(db, "tick", at("20:03"));
     await automate(db, "tick", at("20:04"));
     expect(await reports()).toBe(2);
+    expect(
+      (await db.heartbeat.findUniqueOrThrow({ where: { name: "tick" } })).at,
+    ).toEqual(at("20:04"));
     const keys = (await db.job.findMany({ select: { key: true } })).map(
       (j) => j.key,
     );
     expect(keys.some((k) => k.includes(":weekly:"))).toBe(true);
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
+  });
+  it("reports whether the external scheduler ran recently", async () => {
+    const health = () => integrationHealth(db, owner);
+    expect((await health()).integrations.scheduler).toBe(false);
+    expect((await health()).schedulerLastRunAt).toBeNull();
+    const stale = new Date(Date.now() - 10 * 60 * 1000);
+    await db.heartbeat.create({ data: { name: "tick", at: stale } });
+    expect((await health()).integrations.scheduler).toBe(false);
+    expect((await health()).schedulerLastRunAt).toEqual(stale);
+    await db.heartbeat.update({
+      where: { name: "tick" },
+      data: { at: new Date() },
+    });
+    expect((await health()).integrations.scheduler).toBe("berjalan");
   });
 });

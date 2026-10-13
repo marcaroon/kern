@@ -199,3 +199,8 @@ model AuditLog {
 
   @@index([ownerId, createdAt])
 }
+
+model Heartbeat {
+  name String   @id
+  at   DateTime @db.Timestamptz(3)
+}
