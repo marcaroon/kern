@@ -1,0 +1,8 @@
+node_modules
+.next
+src/generated
+.local
+coverage
+package-lock.json
+next-env.d.ts
+prisma/schema.prisma

@@ -1,0 +1,9 @@
+node_modules/
+.next/
+.env*
+!.env.example
+src/generated/
+coverage/
+*.tsbuildinfo
+.local/
+test-results/
