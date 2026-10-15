@@ -10,7 +10,7 @@ Step-by-step guide for installing your own copy (Bahasa Indonesia, no local tool
 
 ## Run locally
 
-Requirements: Node.js 22.12+ (tested with 22.23.1), npm, a Supabase project with PostgreSQL and one Auth user. Optional: a Telegram bot, OpenAI, Anthropic or Gemini, Google Sheets, n8n. No live credentials are included. Without Supabase configuration the app shows a setup message; it does **not** expose a fake logged-in dashboard.
+Requirements: Node.js 22.12+ (tested with 22.23.1), npm, a Supabase project with PostgreSQL and one Auth user. Optional: a Telegram bot, Groq, OpenAI, Anthropic or Gemini, Google Sheets, n8n. No live credentials are included. Without Supabase configuration the app shows a setup message; it does **not** expose a fake logged-in dashboard.
 
 From PowerShell in this folder:
 
@@ -58,7 +58,9 @@ The local worker polls Telegram and processes inbox, reminders, outbound message
 - Task creation/edit/completion/cancellation with priority and due dates; searchable editable/archiveable notes.
 - One-time/daily/weekly/monthly reminders, original-day monthly clamping, one-occurrence catch-up, generation-based cancellation and persistent delivery status.
 - Telegram polling (or secret-token webhook), explicit user-ID allowlist for private chats, durable message deduplication and atomic domain action + reply enqueue.
-- Official OpenAI, Anthropic or Google Gemini SDK with schema-constrained structured output, business validation, confidence gating, expiring confirmations, and a small deterministic fallback.
+- Friendly conversational replies with 30-minute context, and plain `ya`/`batal` answers to confirmations.
+- Receipt photos read by a vision model and recorded as income/expense after a `ya`; split bill from a receipt or a stated total, computed exactly in rupiah ([details](docs/SETUP_AI.md#receipt-photos-and-split-bill)).
+- Groq via the OpenAI-compatible API, or official OpenAI, Anthropic or Google Gemini SDK with schema-constrained structured output, business validation, confidence gating, expiring confirmations, and a small deterministic fallback.
 - Transactional Sheets outbox, stable row reservations, RAW writes, verification, bounded retries and manual recovery.
 - Authenticated Supabase dashboard and APIs; no browser database credentials; RLS enabled without public policies on application tables.
 - Importable n8n workflows for dispatcher, daily briefing, weekly review, Sheets, optional daily recap and content retention.
@@ -80,3 +82,5 @@ Built-in request rate limits are per process. Add shared edge limits before mult
 Troubleshooting: `CONFIGURATION_REQUIRED` means required environment values are absent; `TELEGRAM_403` means the owner blocked or never started the bot; `TELEGRAM_WEBHOOK_ACTIVE` means polling is blocked by a registered webhook; `SHEETS_ROW_CONFLICT`/`SHEETS_ROW_MOVED` means the managed worksheet was changed. Inspect Integrasi, correct the cause, then retry the specific failed job. A database failure returns an error and never claims a save succeeded. Never paste credentials into issue reports or screenshots.
 
 Production builds inline NEXT_PUBLIC variables. Rebuild after changing those values; restart the development server for local changes. Do not overwrite an existing .env when following setup steps.
+
+Read-only integration diagnostics: `npm run integrations:check`. For the Groq configuration and verification limits, see [AI setup](docs/SETUP_AI.md).

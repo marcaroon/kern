@@ -46,6 +46,7 @@ export async function dispatchMessages(
   database: Database,
   send: (payload: Outbound, ownerId: string, now: Date) => Promise<string>,
   now = new Date(),
+  limit = 30,
 ) {
   // A crashed send may already have reached Telegram. Never automatically resend it.
   await database.job.updateMany({
@@ -62,7 +63,7 @@ export async function dispatchMessages(
       availableAt: { lte: now },
     },
     orderBy: { createdAt: "asc" },
-    take: 30,
+    take: limit,
   });
   let processed = 0;
   for (const job of jobs) {

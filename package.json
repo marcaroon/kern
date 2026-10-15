@@ -21,6 +21,7 @@
     "sheets:init": "tsx scripts/init-sheets.ts",
     "worker": "tsx scripts/worker.ts",
     "telegram": "tsx scripts/telegram.ts",
+    "integrations:check": "tsx scripts/check-integrations.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "pretest": "prisma generate",

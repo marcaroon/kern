@@ -1,6 +1,5 @@
 import { z } from "zod";
 import type { Tx } from "@/lib/db";
-import { json } from "@/lib/db";
 import { AppError } from "@/lib/errors";
 import { intentSchema, type Intent } from "./ai";
 import {
@@ -9,12 +8,16 @@ import {
   voidTransaction,
   saveBudget,
   budgetStatus,
+  categoryLabel,
   rupiah,
 } from "./finance";
+import { latestPending, propose } from "./pending";
+import { handleSplitRequest, receiptDeps, type ReceiptDeps } from "./receipts";
 import { saveTask, saveNote, saveReminder, resolveMatch } from "./records";
 import { report } from "./reporting";
 import { displayDate } from "@/lib/time";
 import { DateTime } from "luxon";
+import { configured } from "@/lib/config";
 import { money, isoDate } from "@/lib/validation";
 
 const destructive = new Set([
@@ -28,8 +31,64 @@ const destructive = new Set([
   "archive_note",
   "set_budget",
 ]);
-const help =
-  "KERN bisa mencatat pengeluaran/pemasukan, task, pengingat, ide, anggaran, dan laporan. Contoh:\n• Pengeluaran 35000 makan siang QRIS\n• Tambah task revisi dashboard\n• Ingatkan besok jam 9 pagi buat follow up vendor\n• Catat ide: SaaS klinik hewan\n• Total pengeluaran minggu ini\n• Cari catatan ESP32\nKoreksi/batalkan dengan ID dari balasan. Perubahan penting meminta “konfirmasi ID”.";
+const help = [
+  "Hai! 👋 Aku KERN, asisten pribadimu. Ngobrol aja kayak biasa, misalnya:",
+  "💸 “makan siang 35rb pakai QRIS” atau “gajian 8jt”",
+  "🧾 Kirim foto nota/struk, nanti aku baca dan catat",
+  "🍕 Foto nota + caption “split bill: aku nasi goreng, Budi mie ayam”, atau “split 300rb bagi 3”",
+  "✅ “tambah task revisi dashboard”",
+  "⏰ “ingatkan besok jam 9 pagi buat follow up vendor”",
+  "💡 “catat ide: SaaS klinik hewan”",
+  "📊 “pengeluaran minggu ini berapa?” · “agenda hari ini”",
+  "Salah catat? Bilang aja “batalkan transaksi tadi”. Untuk perubahan penting aku tanya dulu, cukup balas “ya” atau “batal”.",
+].join("\n");
+
+const labels: Record<string, string> = {
+  correct_transaction: "koreksi transaksi",
+  void_transaction: "batalkan transaksi",
+  update_task: "ubah tugas",
+  complete_task: "selesaikan tugas",
+  cancel_task: "batalkan tugas",
+  reschedule_reminder: "ubah jadwal pengingat",
+  cancel_reminder: "batalkan pengingat",
+  update_note: "ubah catatan",
+  archive_note: "arsipkan catatan",
+  set_budget: "atur anggaran",
+  create_transaction: "catat transaksi",
+  create_task: "buat tugas",
+  create_note: "simpan catatan",
+  create_reminder: "buat pengingat",
+  split_bill: "bagi tagihan",
+  title: "Judul",
+  content: "Isi",
+  type: "Jenis",
+  amount: "Nominal",
+  currency: "Mata uang",
+  category: "Kategori",
+  paymentMethod: "Pembayaran",
+  accountId: "Rekening asal",
+  toAccountId: "Rekening tujuan",
+  date: "Waktu",
+  scheduledAt: "waktu pengingat",
+  recurrence: "Pengulangan",
+  priority: "Prioritas",
+  status: "Status",
+  project: "Proyek",
+  tags: "Label",
+  period: "Periode",
+  month: "Bulan",
+  income: "pemasukan",
+  expense: "pengeluaran",
+  transfer: "transfer",
+  once: "sekali",
+  daily: "setiap hari",
+  weekly: "setiap minggu",
+  monthly: "setiap bulan",
+  open: "belum selesai",
+  in_progress: "sedang dikerjakan",
+  completed: "selesai",
+  cancelled: "dibatalkan",
+};
 
 async function resolveTarget(tx: Tx, ownerId: string, input: Intent) {
   const e = input.entities;
@@ -90,6 +149,7 @@ export async function executeIntent(
   now: Date,
   zone: string,
   confirmed = false,
+  deps: Pick<ReceiptDeps, "plan"> = receiptDeps,
 ): Promise<string> {
   const input = intentSchema.parse(raw),
     e = input.entities;
@@ -102,7 +162,7 @@ export async function executeIntent(
   )
     return (
       e.answer ||
-      `Perjelas ${input.missing_fields.join(", ") || "pesannya"} sebelum disimpan.`
+      `Boleh lengkapi ${input.missing_fields.map((field) => labels[field]?.toLowerCase() || "detail yang kurang").join(", ") || "pesannya"}? Balas aja detailnya, ya. Belum ada yang aku simpan.`
     );
   if (
     (destructive.has(input.intent) || input.requires_confirmation) &&
@@ -113,16 +173,15 @@ export async function executeIntent(
         ? null
         : await resolveTarget(tx, ownerId, input);
     if (target) e.id = target.id;
-    const pending = await tx.pendingAction.create({
-      data: {
-        ownerId,
-        payload: json({
-          intent: input,
-          targetUpdatedAt: target?.updatedAt?.toISOString() || null,
-        }),
-        expiresAt: new Date(now.getTime() + 10 * 60000),
+    const pending = await propose(
+      tx,
+      ownerId,
+      {
+        intent: input,
+        targetUpdatedAt: target?.updatedAt?.toISOString() || null,
       },
-    });
+      now,
+    );
     const changes = Object.entries(e)
       .filter(
         ([key, value]) =>
@@ -130,19 +189,23 @@ export async function executeIntent(
       )
       .map(
         ([key, value]) =>
-          `${key}: ${key === "amount" ? rupiah(String(value)) : key === "date" ? displayDate(new Date(String(value)), zone) : Array.isArray(value) ? value.join(", ") : String(value)}`,
+          `${labels[key] || key}: ${key === "amount" ? rupiah(String(value)) : key === "date" ? displayDate(new Date(String(value)), zone) : Array.isArray(value) ? value.join(", ") : ["type", "recurrence", "status"].includes(key) ? labels[String(value)] || String(value) : String(value)}`,
       )
       .join("\n");
-    return `Tinjau perubahan: ${input.intent}${target ? ` — ${target.title} (${target.id})` : ""}.\n${changes.slice(0, 2500)}\nBalas “konfirmasi ${pending.id}” dalam 10 menit, atau abaikan untuk batal.`;
+    return `Aku akan ${labels[input.intent] || "menjalankan permintaan ini"}${target ? `: “${target.title}”` : ""}. Sudah sesuai?\n${changes.slice(0, 2500)}\nBelum aku ubah. Balas “ya” untuk lanjut atau “batal” (berlaku 10 menit).\nKode konfirmasi: ${pending.id}`;
   }
   switch (input.intent) {
     case "help":
       return help;
     case "general":
-      return `Informasi umum (bukan dari catatan pribadi): ${e.answer || "Silakan gunakan Bantuan untuk melihat kemampuan KERN."}`;
+      return (
+        e.answer || "Mau aku bantu apa? Ketik “bantuan” untuk lihat contoh."
+      );
+    case "split_bill":
+      return handleSplitRequest(tx, ownerId, input, now, deps);
     case "create_transaction": {
       if (e.currency !== "IDR")
-        return "KERN hanya mencatat rupiah (IDR). Sebutkan mata uang dan nominal yang jelas.";
+        return "Aku cuma bisa mencatat dalam rupiah (IDR). Boleh tulis nominal rupiahnya?";
       const row = await saveTransaction(
         tx,
         ownerId,
@@ -158,14 +221,17 @@ export async function executeIntent(
         },
         { source: "telegram", messageId, now, zone },
       );
-      return `${row.type === "expense" ? "Pengeluaran" : row.type === "income" ? "Pemasukan" : "Transfer"} ${rupiah(row.amount)} dicatat sebagai ${row.category === "food" ? "Makan & Minum" : row.category}.${row.paymentMethod ? ` Pembayaran: ${row.paymentMethod}.` : ""}\nID: ${row.id}. Koreksi/batalkan dengan ID ini. Sinkronisasi Sheets masuk antrean.`;
+      const today = DateTime.fromJSDate(row.occurredAt)
+        .setZone(zone)
+        .hasSame(DateTime.fromJSDate(now).setZone(zone), "day");
+      return `✅ Sudah aku catat: ${labels[row.type]} ${rupiah(row.amount)} untuk “${row.description}” (${categoryLabel(row.category)})${today ? "" : `, ${displayDate(row.occurredAt, zone)}`}.${row.paymentMethod ? ` Dibayar lewat ${row.paymentMethod}.` : ""}\n${configured("GOOGLE_SHEETS_SPREADSHEET_ID", "GOOGLE_SERVICE_ACCOUNT_JSON") ? "Salinan ke spreadsheet menyusul sebentar lagi." : "Tersimpan di KERN (spreadsheet belum terhubung)."}\nID: ${row.id}`;
     }
     case "correct_transaction":
     case "void_transaction": {
       const target = await resolveTarget(tx, ownerId, input);
       if (input.intent === "void_transaction") {
         await voidTransaction(tx, ownerId, target.id, now);
-        return `Transaksi ${target.id} dibatalkan.`;
+        return `Oke, transaksi “${target.title}” sudah aku batalkan. Riwayatnya tetap tersimpan.`;
       }
       const row = await tx.transaction.findUniqueOrThrow({
         where: { id: target.id },
@@ -185,7 +251,7 @@ export async function executeIntent(
         },
         { id: row.id, now, zone },
       );
-      return `Transaksi ${row.id} dikoreksi; riwayat disimpan.`;
+      return `Sudah aku koreksi: “${e.title || row.description}” sekarang ${rupiah(e.amount || row.amount.toString())}. Versi lamanya tetap tersimpan di riwayat.`;
     }
     case "create_task": {
       const row = await saveTask(
@@ -201,7 +267,7 @@ export async function executeIntent(
         undefined,
         now,
       );
-      return `Task “${row.title}” disimpan${row.dueAt ? ` untuk ${displayDate(row.dueAt, zone)}` : ""}. ID: ${row.id}.`;
+      return `Siap, aku tambahkan “${row.title}” ke daftar tugas${row.dueAt ? ` untuk ${displayDate(row.dueAt, zone)}` : ""}.\nID: ${row.id}`;
     }
     case "update_task":
     case "complete_task":
@@ -228,7 +294,7 @@ export async function executeIntent(
         row.id,
         now,
       );
-      return `Task “${result.title}”: ${result.status}.`;
+      return `Sudah aku perbarui: “${result.title}” sekarang ${labels[result.status] || result.status}.`;
     }
     case "list_tasks": {
       const rows = await tx.task.findMany({
@@ -244,13 +310,13 @@ export async function executeIntent(
         take: 15,
       });
       return rows.length
-        ? rows
+        ? `Ini daftar tugasmu (${rows.length}):\n${rows
             .map(
               (r) =>
-                `P${r.priority} ${r.title} (${r.id})${r.dueAt ? ` — ${displayDate(r.dueAt, zone)}` : ""}`,
+                `${r.priority === 1 ? "🔴" : r.priority === 2 ? "🟡" : "⚪"} ${r.title}${r.dueAt ? ` — ${displayDate(r.dueAt, zone)}` : ""}\n   ID: ${r.id}`,
             )
-            .join("\n")
-        : "Belum ada task yang sesuai.";
+            .join("\n")}`
+        : "Belum ada tugas yang sesuai. Santai dulu 😄";
     }
     case "create_reminder": {
       const row = await saveReminder(
@@ -266,7 +332,7 @@ export async function executeIntent(
         undefined,
         now,
       );
-      return `Pengingat “${row.title}” dijadwalkan ${displayDate(row.scheduledAt, zone)} (${row.recurrence}). ID: ${row.id}. Status pengiriman belum terkirim.`;
+      return `Siap, pengingat “${row.title}” sudah aku jadwalkan untuk ${displayDate(row.scheduledAt, zone)}${row.recurrence === "once" ? "" : `, ${labels[row.recurrence]}`}.\nID: ${row.id}`;
     }
     case "reschedule_reminder":
     case "cancel_reminder": {
@@ -290,8 +356,8 @@ export async function executeIntent(
         now,
       );
       return result.status === "cancelled"
-        ? `Pengingat “${result.title}” dibatalkan.`
-        : `Pengingat dijadwalkan ulang: ${displayDate(result.scheduledAt, zone)}.`;
+        ? `Oke, pengingat “${result.title}” sudah aku batalkan.`
+        : `Siap, pengingat “${result.title}” aku pindah ke ${displayDate(result.scheduledAt, zone)}.`;
     }
     case "list_reminders": {
       const rows = await tx.reminder.findMany({
@@ -300,12 +366,12 @@ export async function executeIntent(
         take: 15,
       });
       return rows.length
-        ? rows
+        ? `Pengingat yang aktif:\n${rows
             .map(
               (r) =>
-                `${r.title} — ${displayDate(r.nextRunAt!, zone)} (${r.id})`,
+                `⏰ ${r.title} — ${displayDate(r.nextRunAt!, zone)}\n   ID: ${r.id}`,
             )
-            .join("\n")
+            .join("\n")}`
         : "Belum ada pengingat aktif.";
     }
     case "create_note": {
@@ -316,7 +382,7 @@ export async function executeIntent(
         category: e.category || "general",
         project: e.project,
       });
-      return `Catatan “${row.title}” disimpan. ID: ${row.id}.`;
+      return `Sudah aku simpan: “${row.title}”. Nanti bisa kamu cari lagi lewat judul atau isinya.\nID: ${row.id}`;
     }
     case "update_note":
     case "archive_note": {
@@ -335,7 +401,7 @@ export async function executeIntent(
         },
         row.id,
       );
-      return `Catatan “${row.title}” ${input.intent === "archive_note" ? "diarsipkan" : "diperbarui"}.`;
+      return `Sudah, catatan “${row.title}” ${input.intent === "archive_note" ? "aku arsipkan" : "aku perbarui"}.`;
     }
     case "search_notes": {
       const query = e.query || "";
@@ -355,10 +421,12 @@ export async function executeIntent(
         take: 5,
       });
       return rows.length
-        ? rows
-            .map((r) => `${r.title}: ${r.content.slice(0, 500)}\nID: ${r.id}`)
-            .join("\n\n")
-        : "Tidak ditemukan dalam catatan yang disimpan.";
+        ? `Ketemu ${rows.length} catatan:\n\n${rows
+            .map(
+              (r) => `📝 ${r.title}\n${r.content.slice(0, 500)}\nID: ${r.id}`,
+            )
+            .join("\n\n")}`
+        : "Tidak ditemukan dalam catatan yang kamu simpan.";
     }
     case "set_budget": {
       const row = await saveBudget(
@@ -374,18 +442,18 @@ export async function executeIntent(
         now,
         zone,
       );
-      return `Anggaran ${row.category} ${row.month}: ${rupiah(row.amount)}.`;
+      return `Siap, anggaran ${categoryLabel(row.category)} untuk ${row.month} jadi ${rupiah(row.amount)}.`;
     }
     case "inspect_budget": {
       const rows = await budgetStatus(tx, ownerId, now, zone);
       return rows.length
-        ? rows
+        ? `Anggaran bulan ini:\n${rows
             .map(
               (r) =>
-                `${r.category}: ${rupiah(r.spent)} / ${rupiah(r.amount)} (${r.percent}%)`,
+                `${r.exceeded ? "🔴" : r.warning ? "🟡" : "🟢"} ${categoryLabel(r.category)}: ${rupiah(r.spent)} dari ${rupiah(r.amount)} (${r.percent}%)`,
             )
-            .join("\n")
-        : "Belum ada anggaran bulan ini.";
+            .join("\n")}`
+        : "Belum ada anggaran bulan ini. Mau bikin? Contoh: “anggaran makan 2jt bulan ini”.";
     }
     case "finance_summary": {
       const result = await financeSummary(
@@ -395,13 +463,30 @@ export async function executeIntent(
         now,
         zone,
       );
+      const period = {
+        today: "hari ini",
+        week: "minggu ini",
+        month: "bulan ini",
+        previous_month: "bulan lalu",
+      }[e.period || "month"];
+      const top = Object.entries(result.categories).sort(([, a], [, b]) =>
+        b > a ? 1 : b < a ? -1 : 0,
+      );
       return result.count
-        ? `Dari transaksi tercatat: pemasukan ${rupiah(result.income)}, pengeluaran ${rupiah(result.expense)}.\n${Object.entries(
-            result.categories,
-          )
-            .map(([c, a]) => `${c}: ${rupiah(a)}`)
-            .join("\n")}`
-        : "Belum ada transaksi yang dicatat pada periode ini.";
+        ? [
+            `Ringkasan ${period} (dari ${result.count} transaksi tercatat):`,
+            `💰 Pemasukan: ${rupiah(result.income)}`,
+            `💸 Pengeluaran: ${rupiah(result.expense)}`,
+            `${result.balance >= 0n ? "📈" : "📉"} Selisih: ${result.balance < 0n ? "-" : ""}${rupiah(result.balance < 0n ? -result.balance : result.balance)}`,
+            ...(top.length
+              ? [
+                  "",
+                  "Pengeluaran per kategori:",
+                  ...top.map(([c, a]) => `• ${categoryLabel(c)}: ${rupiah(a)}`),
+                ]
+              : []),
+          ].join("\n")
+        : `Belum ada transaksi yang tercatat ${period}.`;
     }
     case "agenda":
       return report(tx, ownerId, "daily", now, zone);
@@ -423,14 +508,21 @@ export async function confirmAction(
     where: { id, ownerId, consumedAt: null, expiresAt: { gt: now } },
   });
   if (!pending)
-    return "Konfirmasi kedaluwarsa atau sudah digunakan. Kirim ulang permintaan perubahannya.";
+    return "Konfirmasinya sudah kedaluwarsa atau sudah dipakai. Kirim ulang permintaannya, ya.";
   const payload = z
-    .object({ intent: intentSchema, targetUpdatedAt: z.string().nullable() })
+    .object({
+      intent: intentSchema.optional(),
+      targetUpdatedAt: z.string().nullable().optional(),
+    })
     .parse(pending.payload);
+  if (!payload.intent) {
+    await tx.pendingAction.update({ where: { id }, data: { consumedAt: now } });
+    return "Oke 👍";
+  }
   if (payload.targetUpdatedAt) {
     const target = await resolveTarget(tx, ownerId, payload.intent);
     if (target.updatedAt.toISOString() !== payload.targetUpdatedAt)
-      return "Catatan sudah berubah sejak konfirmasi dibuat. Kirim ulang permintaannya.";
+      return "Datanya sudah berubah sejak aku tanya tadi, jadi belum aku ubah. Kirim ulang permintaannya, ya.";
   }
   const consumed = await tx.pendingAction.updateMany({
     where: { id, consumedAt: null },
@@ -438,4 +530,32 @@ export async function confirmAction(
   });
   if (!consumed.count) return "Konfirmasi sudah digunakan.";
   return executeIntent(tx, ownerId, payload.intent, messageId, now, zone, true);
+}
+
+// "ya" / "batal" answer the latest open proposal. Null means none is open, so the
+// message is treated as an ordinary request instead.
+const yes =
+  /^(ya+|iya+|iy|y|yes|ok(e|ey)?|okay|sip|siap|simpan|lanjut(kan)?|gas|betul|benar|bener|setuju|confirm|konfirmasi)[!. ]*$/i;
+const no =
+  /^(batal(kan)?|tidak|nggak|ngga|gak|ga|no|cancel|jangan|(gak|ga|nggak|tidak) jadi)[!. ]*$/i;
+export async function answerProposal(
+  tx: Tx,
+  ownerId: string,
+  text: string,
+  messageId: string,
+  now: Date,
+  zone: string,
+): Promise<string | null> {
+  const answer = text.trim();
+  if (!yes.test(answer) && !no.test(answer)) return null;
+  const pending = await latestPending(tx, ownerId, now);
+  if (!pending) return null;
+  if (no.test(answer)) {
+    await tx.pendingAction.update({
+      where: { id: pending.id },
+      data: { consumedAt: now },
+    });
+    return "Oke, nggak jadi. Belum ada yang aku ubah.";
+  }
+  return confirmAction(tx, ownerId, pending.id, messageId, now, zone);
 }

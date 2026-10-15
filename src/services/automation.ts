@@ -35,10 +35,10 @@ export async function automate(
       };
     }
     case "reply":
-      // Webhook mode: answer stored messages within the same request (no resident worker).
+      // Bound webhook work to one message; the scheduler drains any backlog.
       return {
-        inbox: await processInbox(database, now, zone),
-        messages: await dispatchMessages(database, telegramSender(), now),
+        inbox: await processInbox(database, now, zone, undefined, 1),
+        messages: await dispatchMessages(database, telegramSender(), now, 1),
       };
     case "tick": {
       // One external per-minute scheduler call drives everything on serverless hosts.
@@ -113,7 +113,7 @@ export async function automate(
             createdAt: { lt: cutoff },
             text: { not: "[REDACTED]" },
           },
-          data: { text: "[REDACTED]" },
+          data: { text: "[REDACTED]", fileId: null, fileMime: null },
         }),
         jobs: await tx.job.updateMany({
           where: {

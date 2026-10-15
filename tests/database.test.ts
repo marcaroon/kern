@@ -1,6 +1,7 @@
 import {
   beforeAll,
   afterAll,
+  afterEach,
   beforeEach,
   describe,
   expect,
@@ -21,7 +22,9 @@ import {
 import { saveTask, saveReminder } from "@/services/records";
 import { ingestUpdates, pollUpdates } from "@/integrations/telegram";
 import { processInbox } from "@/services/inbox";
-import { fallback, intent } from "@/services/ai";
+import { fallback, intent, type Turn } from "@/services/ai";
+import { planSplit, type ReceiptDeps } from "@/services/receipts";
+import { AppError } from "@/lib/errors";
 import { executeIntent, confirmAction } from "@/services/conversation";
 import { materializeReminders } from "@/services/reminders";
 import { dispatchMessages, DeliveryError, enqueue } from "@/services/queue";
@@ -386,6 +389,8 @@ describe("Telegram durable inbox and conversations", () => {
       ),
     );
     expect(reply).toContain("konfirmasi");
+    expect(reply).toContain("Aku akan batalkan transaksi");
+    expect(reply).not.toContain("void_transaction");
     expect(
       (await db.transaction.findUniqueOrThrow({ where: { id: row.id } }))
         .status,
@@ -402,7 +407,7 @@ describe("Telegram durable inbox and conversations", () => {
       await db.$transaction((tx) =>
         confirmAction(tx, owner, pending.id, "m3", now, "Asia/Jakarta"),
       ),
-    ).toContain("sudah digunakan");
+    ).toContain("sudah dipakai");
   });
   it("does not fabricate a memory", async () => {
     expect(
@@ -417,6 +422,25 @@ describe("Telegram durable inbox and conversations", () => {
         ),
       ),
     ).toContain("Tidak ditemukan");
+  });
+  it("keeps user text intact while translating confirmation labels", async () => {
+    const reply = await db.$transaction((tx) =>
+      executeIntent(
+        tx,
+        owner,
+        intent(
+          "create_task",
+          { title: "completed" },
+          { requires_confirmation: true },
+        ),
+        "preview",
+        now,
+        "Asia/Jakarta",
+      ),
+    );
+    expect(reply).toContain("Judul: completed");
+    expect(reply).not.toContain("Judul: selesai");
+    expect(await db.task.count()).toBe(0);
   });
 });
 describe("persistent reminders and outbound retry", () => {
@@ -567,6 +591,20 @@ describe("Google Sheets outbox under partial failure", () => {
     );
     vi.unstubAllEnvs();
   });
+  it("preserves occupied cells even when their transaction ID is blank", async () => {
+    const row = await db.$transaction((tx) =>
+      saveTransaction(tx, owner, transaction(), { now }),
+    );
+    const fake = fakeSheet();
+    const existing = ["", "manual data to preserve"];
+    fake.rows.set(row.sheetRow + 1, existing);
+    await syncSheets(db, now, fake.sheet);
+    expect(fake.rows.get(row.sheetRow + 1)).toEqual(existing);
+    expect(await db.sheetSyncOutbox.findFirstOrThrow()).toMatchObject({
+      status: "retry",
+      lastError: "SHEETS_ROW_CONFLICT",
+    });
+  });
 });
 describe("serverless webhook and scheduler", () => {
   const secret = "s".repeat(32);
@@ -578,6 +616,7 @@ describe("serverless webhook and scheduler", () => {
     vi.stubEnv("KERN_OWNER_SUPABASE_USER_ID", owner);
     for (const name of [
       "AI_PROVIDER",
+      "GROQ_API_KEY",
       "OPENAI_API_KEY",
       "ANTHROPIC_API_KEY",
       "GEMINI_API_KEY",
@@ -631,6 +670,38 @@ describe("serverless webhook and scheduler", () => {
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
   });
+  it("bounds webhook processing and leaves the remaining inbox for the scheduler", async () => {
+    hosted();
+    let sentId = 10;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({ ok: true, result: { message_id: sentId++ } }),
+          ),
+      ),
+    );
+    try {
+      await ingest(update(50), update(51));
+      await automate(db, "reply", now);
+      expect(
+        await db.inboxMessage.count({ where: { status: "processed" } }),
+      ).toBe(1);
+      expect(
+        await db.inboxMessage.count({ where: { status: "pending" } }),
+      ).toBe(1);
+      expect(await db.transaction.count()).toBe(1);
+      await automate(db, "dispatch", now);
+      expect(
+        await db.inboxMessage.count({ where: { status: "processed" } }),
+      ).toBe(2);
+      expect(await db.transaction.count()).toBe(2);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
+  });
   it("fires daily and weekly reports once inside their WIB windows", async () => {
     hosted();
     vi.stubGlobal(
@@ -674,5 +745,247 @@ describe("serverless webhook and scheduler", () => {
       data: { at: new Date() },
     });
     expect((await health()).integrations.scheduler).toBe("berjalan");
+  });
+});
+describe("receipt photos, split bill and conversation", () => {
+  const photo = (messageId: number, caption?: string, size = 200000) => ({
+    update_id: updateId++,
+    message: {
+      message_id: messageId,
+      date: now.getTime() / 1000,
+      chat: { id: ownerChat, type: "private" },
+      from: { id: ownerChat, is_bot: false },
+      photo: [
+        { file_id: "small", file_size: 1000, width: 90, height: 90 },
+        { file_id: "large", file_size: size, width: 1280, height: 960 },
+      ],
+      ...(caption ? { caption } : {}),
+    },
+  });
+  const reading = {
+    is_receipt: true,
+    type: "expense" as const,
+    merchant: "Warung Bu Sri",
+    date: null,
+    currency: "IDR",
+    items: [
+      { name: "Nasi goreng", quantity: 1, amount: "25000" },
+      { name: "Mie ayam", quantity: 1, amount: "20000" },
+      { name: "Es teh", quantity: 2, amount: "10000" },
+    ],
+    subtotal: "55000",
+    tax: "5500",
+    service: null,
+    discount: null,
+    total: "60500",
+    payment_method: "QRIS",
+    category: "food",
+    problem: null,
+  };
+  const media = (overrides: Partial<ReceiptDeps> = {}): ReceiptDeps => ({
+    download: vi.fn(async () => Buffer.from("image")),
+    read: vi.fn(async () => reading),
+    plan: planSplit,
+    ...overrides,
+  });
+  const run = (
+    deps: ReceiptDeps,
+    parser: Parameters<typeof processInbox>[3] = parse,
+  ) => processInbox(db, now, "Asia/Jakarta", parser, 10, deps);
+  const replies = async () =>
+    (await db.job.findMany({ orderBy: { createdAt: "asc" } })).map(
+      (j) => (j.payload as { text: string }).text,
+    );
+  function noAi() {
+    for (const name of [
+      "AI_PROVIDER",
+      "GROQ_API_KEY",
+      "OPENAI_API_KEY",
+      "ANTHROPIC_API_KEY",
+      "GEMINI_API_KEY",
+    ])
+      vi.stubEnv(name, "");
+  }
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("stores only the Telegram file reference of a photo, never the image", async () => {
+    await ingest(photo(60, "makan siang"), photo(61, undefined, 9_000_000));
+    const rows = await db.inboxMessage.findMany({ orderBy: { id: "asc" } });
+    expect(rows[0]).toMatchObject({
+      text: "makan siang",
+      fileId: "large",
+      fileMime: "image/jpeg",
+    });
+    // The oversized size is skipped in favour of the largest one that fits.
+    expect(rows[1]).toMatchObject({ fileId: "small" });
+  });
+  it("proposes a receipt and records it only after a plain “ya”", async () => {
+    const deps = media();
+    await ingest(photo(62));
+    await run(deps);
+    expect(await db.transaction.count()).toBe(0);
+    expect(deps.download).toHaveBeenCalledWith("large");
+    expect((await replies())[0]).toContain("Rp60.500");
+    expect((await replies())[0]).toContain("Balas “ya”");
+    await ingest(update(63, "ya"));
+    await run(deps);
+    const row = await db.transaction.findFirstOrThrow();
+    expect(row).toMatchObject({
+      amount: 60500n,
+      description: "Warung Bu Sri",
+      category: "food",
+      paymentMethod: "QRIS",
+      source: "telegram",
+    });
+    expect(await db.sheetSyncOutbox.count()).toBe(1);
+    // A second "ya" has nothing to confirm and never records twice.
+    await ingest(update(64, "ya"));
+    await run(deps);
+    expect(await db.transaction.count()).toBe(1);
+  });
+  it("drops the proposal on “batal” and honestly rejects non-receipts", async () => {
+    await ingest(photo(65));
+    await run(media());
+    await ingest(update(66, "batal"));
+    await run(media());
+    expect(await db.transaction.count()).toBe(0);
+    expect((await replies())[1]).toContain("nggak jadi");
+    await ingest(photo(67));
+    await run(
+      media({ read: vi.fn(async () => ({ ...reading, is_receipt: false })) }),
+    );
+    expect((await replies())[2]).toContain("bukan nota");
+    expect(await db.pendingAction.count({ where: { consumedAt: null } })).toBe(
+      0,
+    );
+  });
+  it("answers provider and currency failures without writing", async () => {
+    await ingest(photo(68), photo(69));
+    let calls = 0;
+    await run(
+      media({
+        read: vi.fn(async () => {
+          if (calls++ === 0)
+            throw new AppError("VISION_UNAVAILABLE", 503, "lagi gagal membaca");
+          return { ...reading, currency: "USD" };
+        }),
+      }),
+    );
+    const texts = await replies();
+    expect(texts[0]).toContain("lagi gagal membaca");
+    expect(texts[1]).toContain("rupiah");
+    expect(await db.pendingAction.count()).toBe(0);
+    expect(
+      await db.inboxMessage.count({ where: { status: "processed" } }),
+    ).toBe(2);
+  });
+  it("splits a captioned receipt and records only the user's share", async () => {
+    const plan = vi.fn(async () => ({
+      participants: ["aku", "Budi"],
+      assignments: [
+        { item: 1, people: ["aku"] },
+        { item: 2, people: ["Budi"] },
+      ],
+      question: null,
+    }));
+    await ingest(photo(70, "split bill: aku nasi goreng, Budi mie ayam"));
+    await run(media({ plan }));
+    const text = (await replies())[0];
+    expect(text).toContain("Kamu: Rp33.000");
+    expect(text).toContain("Budi: Rp27.500");
+    expect(text).toContain("Dibagi rata: Es teh");
+    await ingest(update(71, "oke"));
+    await run(media({ plan }));
+    expect(await db.transaction.findFirstOrThrow()).toMatchObject({
+      amount: 33000n,
+      description: "Bagianku: Warung Bu Sri",
+    });
+  });
+  it("splits the last receipt from a text follow-up and supersedes the total", async () => {
+    noAi();
+    await ingest(photo(72));
+    await run(media());
+    await ingest(update(73, "bagi rata 3 orang"));
+    await run(media());
+    expect((await replies())[1]).toContain("Rp20.167");
+    await ingest(update(74, "ya"));
+    await run(media());
+    const rows = await db.transaction.findMany();
+    expect(rows.map((r) => r.amount)).toEqual([20167n]);
+  });
+  it("splits a stated total without a receipt, and asks when there is none", async () => {
+    noAi();
+    await ingest(update(75, "split 300rb bagi 3"));
+    await run(media());
+    expect((await replies())[0]).toContain("Kamu: Rp100.000");
+    await ingest(update(76, "ya"));
+    await run(media());
+    expect((await db.transaction.findFirstOrThrow()).amount).toBe(100000n);
+    await ingest(update(77, "bagi rata 4 orang"));
+    await run(media());
+    expect((await replies())[2]).toContain("Kirim foto notanya");
+  });
+  it("gives the parser recent turns so follow-ups keep context", async () => {
+    const seen: Turn[][] = [];
+    const parser = async (
+      text: string,
+      at: Date,
+      zone: string,
+      history: Turn[],
+    ) => {
+      seen.push(history);
+      return fallback(text, at, zone);
+    };
+    await db.inboxMessage.create({
+      data: {
+        id: "tg:other:1",
+        ownerId: "another-owner",
+        sender: "3003",
+        text: "rahasia orang lain",
+        receivedAt: now,
+        status: "processed",
+      },
+    });
+    await ingest(update(78, "Pengeluaran 35000 makan siang QRIS"));
+    await run(media(), parser);
+    await ingest(update(79, "halo"));
+    await run(media(), parser);
+    expect(seen[0]).toEqual([]);
+    expect(seen[1]).toEqual([
+      {
+        user: "Pengeluaran 35000 makan siang QRIS",
+        reply: expect.stringContaining("Rp35.000"),
+      },
+    ]);
+    // Another owner's messages never appear in the context.
+    expect(JSON.stringify(seen)).not.toContain("rahasia");
+  });
+  it("keeps one live proposal so “ya” is never ambiguous", async () => {
+    const row = await db.$transaction((tx) =>
+      saveTransaction(tx, owner, transaction(), { now }),
+    );
+    await db.$transaction((tx) =>
+      executeIntent(
+        tx,
+        owner,
+        intent("void_transaction", { id: row.id }),
+        "a",
+        now,
+        "Asia/Jakarta",
+      ),
+    );
+    await ingest(photo(80));
+    await run(media());
+    expect(await db.pendingAction.count({ where: { consumedAt: null } })).toBe(
+      1,
+    );
+    await ingest(update(81, "ya"));
+    await run(media());
+    // The newer receipt was confirmed; the older void request was superseded.
+    expect(
+      (await db.transaction.findUniqueOrThrow({ where: { id: row.id } }))
+        .status,
+    ).toBe("active");
+    expect(await db.transaction.count()).toBe(2);
   });
 });

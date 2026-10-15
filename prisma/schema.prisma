@@ -130,6 +130,9 @@ model InboxMessage {
   ownerId     String
   sender      String
   text        String
+  // Telegram file_id of an attached receipt image; the image bytes are never stored.
+  fileId      String?
+  fileMime    String?
   receivedAt  DateTime  @db.Timestamptz(3)
   status      String    @default("pending")
   attempts    Int       @default(0)

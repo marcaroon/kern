@@ -98,7 +98,7 @@ export async function upsertSheetRow(
     throw new AppError("SHEETS_ROW_MOVED", 409);
   const range = `Transactions!A${reservedRow}:L${reservedRow}`;
   const existing = (await sheet.read(range))[0];
-  if (existing?.[0] && existing[0] !== row.id)
+  if (existing?.some((cell) => cell !== "") && existing[0] !== row.id)
     throw new AppError("SHEETS_ROW_CONFLICT", 409);
   const expected = sheetValues(row);
   await sheet.write(range, [expected]);

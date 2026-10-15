@@ -12,6 +12,24 @@ const updateSchema = z.object({
       chat: z.object({ id: z.number().int(), type: z.string() }),
       from: z.object({ id: z.number().int(), is_bot: z.boolean() }).optional(),
       text: z.string().max(6000).optional(),
+      caption: z.string().max(1024).optional(),
+      photo: z
+        .array(
+          z.object({
+            file_id: z.string().min(1).max(300),
+            file_size: z.number().int().optional(),
+            width: z.number().int(),
+            height: z.number().int(),
+          }),
+        )
+        .optional(),
+      document: z
+        .object({
+          file_id: z.string().min(1).max(300),
+          mime_type: z.string().optional(),
+          file_size: z.number().int().optional(),
+        })
+        .optional(),
     })
     .optional(),
 });
@@ -21,6 +39,28 @@ const envelope = z.object({
   error_code: z.number().optional(),
 });
 export type TelegramUpdate = z.infer<typeof updateSchema>;
+type TelegramMessage = NonNullable<TelegramUpdate["message"]>;
+// Vision providers accept inline images of a few MB; larger files are refused up front.
+export const maxImageBytes = 4 * 1024 * 1024;
+const imageTypes = ["image/jpeg", "image/png", "image/webp"];
+// Picks the sharpest photo size within the limit, or an image sent as a file.
+export function messageImage(message: TelegramMessage) {
+  if (message.photo?.length) {
+    const fitting = message.photo.filter(
+      (p) => (p.file_size ?? 0) <= maxImageBytes,
+    );
+    const best = fitting.sort(
+      (a, b) => b.width * b.height - a.width * a.height,
+    )[0];
+    return best ? { fileId: best.file_id, mime: "image/jpeg" } : "too_large";
+  }
+  const doc = message.document;
+  if (doc?.mime_type && imageTypes.includes(doc.mime_type))
+    return (doc.file_size ?? 0) <= maxImageBytes
+      ? { fileId: doc.file_id, mime: doc.mime_type }
+      : "too_large";
+  return null;
+}
 export function telegramMode() {
   const mode = process.env.TELEGRAM_MODE;
   if (mode === "webhook" || mode === "polling") return mode;
@@ -84,6 +124,7 @@ export async function ingestUpdates(
     )
       continue;
     const receivedAt = new Date(Math.min(message.date * 1000, now.getTime()));
+    const image = messageImage(message);
     const result = await database.inboxMessage.createMany({
       data: {
         id: inboxId(message.chat.id, message.message_id),
@@ -91,7 +132,17 @@ export async function ingestUpdates(
         sender: String(message.chat.id),
         receivedAt,
         availableAt: now,
-        text: message.text !== undefined ? message.text : "[UNSUPPORTED_MEDIA]",
+        text:
+          message.text !== undefined
+            ? message.text
+            : image === "too_large"
+              ? "[IMAGE_TOO_LARGE]"
+              : image
+                ? (message.caption ?? "")
+                : "[UNSUPPORTED_MEDIA]",
+        ...(image && image !== "too_large"
+          ? { fileId: image.fileId, fileMime: image.mime }
+          : {}),
       },
       skipDuplicates: true,
     });
@@ -115,6 +166,54 @@ async function call(
       signal: AbortSignal.timeout(timeoutMs),
     },
   );
+}
+// Downloads an image into memory for the vision provider. The file URL embeds the bot
+// token, so it is never passed to a third party, stored or included in errors.
+export async function downloadTelegramImage(
+  fileId: string,
+  transport: typeof fetch = fetch,
+): Promise<Buffer> {
+  if (!configured("TELEGRAM_BOT_TOKEN"))
+    throw new AppError("TELEGRAM_NOT_CONFIGURED", 503);
+  let path: string;
+  try {
+    const response = await call(
+      "getFile",
+      { file_id: fileId },
+      transport,
+      10000,
+    );
+    const parsed = z
+      .object({
+        ok: z.literal(true),
+        result: z.object({
+          file_path: z.string().regex(/^[\w./-]+$/),
+          file_size: z.number().int().optional(),
+        }),
+      })
+      .safeParse(await response.json().catch(() => null));
+    if (!response.ok || !parsed.success) throw new Error("TELEGRAM_FILE");
+    if ((parsed.data.result.file_size ?? 0) > maxImageBytes)
+      throw new AppError("IMAGE_TOO_LARGE", 413);
+    path = parsed.data.result.file_path;
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw new AppError("TELEGRAM_FILE_UNAVAILABLE", 503);
+  }
+  let bytes: ArrayBuffer;
+  try {
+    const response = await transport(
+      `https://api.telegram.org/file/bot${required("TELEGRAM_BOT_TOKEN")}/${path}`,
+      { signal: AbortSignal.timeout(15000) },
+    );
+    if (!response.ok) throw new Error("TELEGRAM_FILE");
+    bytes = await response.arrayBuffer();
+  } catch {
+    throw new AppError("TELEGRAM_FILE_UNAVAILABLE", 503);
+  }
+  if (bytes.byteLength > maxImageBytes)
+    throw new AppError("IMAGE_TOO_LARGE", 413);
+  return Buffer.from(bytes);
 }
 export async function pollUpdates(
   database: Database,

@@ -1,5 +1,24 @@
 # Local verification and deployment gate
 
+## Production deployment — 15 October 2026
+
+After the owner signed in to Vercel, production GROQ_API_KEY (sensitive), GROQ_MODEL and AI_PROVIDER=groq were configured from the private local settings. The previous production provider was Gemini. Deployment `dpl_3kL47pm48FQuZAaTXQoFA3qv6Aw3` reached READY and was aliased to https://kern-nine.vercel.app. Vercel CLI 64.2.0 was used because the installed 41.6.1 could no longer upload. Hosted build and TypeScript passed; all six migrations were already applied.
+
+Production smoke checks passed: login HTTP 200; health, internal tick and webhook without credentials HTTP 401; a signed synthetic bot update returned accepted=0 and created no user action. No real Telegram message was sent and no real spreadsheet cells were written by these checks. Groq live basic inference was verified locally as described below, not through a real production chat round trip. Earlier statements about missing deployment credentials describe the state before this deployment.
+
+## Groq and Telegram update — 15 October 2026
+
+- 67 automated tests passed in five files, including Groq endpoint/schema validation, refusal/truncation/outage fallback, invented amounts, single-use confirmations, bounded webhook batches, and preserving occupied Sheets rows with blank IDs.
+- ESLint, TypeScript/Next route generation, and production Next.js build passed.
+- Read-only live checks: database SELECT 1 succeeded; Telegram getMe/getWebhookInfo succeeded with an active webhook, no pending updates and no reported historical webhook error; Google Sheets Transactions headers were read and matched.
+- The local TELEGRAM_MODE was changed from polling to webhook to match the existing remote webhook. No remote webhook configuration was changed.
+- Groq was subsequently configured locally and selected successfully. Live synthetic requests through the actual `interpret` service verified expense extraction (IDR 35000), a tomorrow-at-09:00 reminder in Asia/Makassar, and a general greeting. Six requests yielded four successful validated responses, one HTTP 400 (cause not established), and one HTTP 429 (rate limit); the failed calls returned deterministic clarification instead of executing actions. This verifies basic inference, not sustained availability or broad language accuracy. No API keys or raw provider errors were printed.
+- No live Telegram message was sent, no real spreadsheet cells were written, and no production migration or deployment was performed. Read access does not prove write permission, and bot connectivity does not prove end-to-end delivery. The diagnostics command is `npm run integrations:check`.
+
+Follow-up after the Telegram screenshot: the visible reply text matches the old templates. Deployment access is currently blocked because Vercel CLI has no login credentials. The AI prompt now explicitly distinguishes bank names/payment descriptions from account UUIDs, requires transaction titles, and the adapter rejects account IDs not explicitly present in the input. A synthetic live book-purchase example with `50rb`, QRIS and a fictional bank passed the transaction schema without assigning an account ID. The user's original financial message was not submitted to Groq: automatic approval review blocked that export. Its exact production failure remains unconfirmed. All 68 automated tests, lint and typecheck passed for the follow-up.
+
+The older verification record below is historical and was not fully rerun for this update.
+
 Verified on Windows, Node 22.23.1, 12 October 2026. No live chat sends, paid model requests, real Sheets writes or personal-data seeds were performed.
 
 | Check                     | Result and scope                                                                                                                                                                                                                                                                                       |
@@ -60,4 +79,10 @@ The full development dependency audit reports five high-severity entries in the 
 
 ## Known product boundaries
 
-One owner, text messages, keyword memory and one action per message. Clarifications require resending the full request. Dashboard timezone is WIB. Missing/uncertain provider deliveries need operator configuration/reconciliation. The managed Sheets tab requires fixed rows. Voice, receipts, Calendar, email and semantic retrieval are roadmap features, not implemented capabilities.
+One owner, text messages and receipt photos, keyword memory and one action per message. Conversation context covers the last 30 minutes only. Dashboard timezone is WIB. Missing/uncertain provider deliveries need operator configuration/reconciliation. The managed Sheets tab requires fixed rows. Split bills record only the owner's share; amounts owed by friends are shown, not tracked. Voice, Calendar, email and semantic retrieval are roadmap features, not implemented capabilities.
+
+## Friendlier chat, receipts and split bill (15 October 2026)
+
+Migration `202610150001_receipt_media` adds nullable `InboxMessage.fileId` and `fileMime`. All 95 tests (credential-free, embedded PostgreSQL), lint, strict typecheck, Prettier, the production build and `npm run test:migrations` passed. Tests cover photo ingestion and size limits, token-free download errors, provider request shapes for Groq and Gemini images, receipt normalisation, exact split arithmetic, `ya`/`batal` confirmation, proposal superseding, owner-scoped conversation history and amounts taken only from the user's own words.
+
+**Not verified live:** no real receipt photo has been read by any provider. Groq vision (`GROQ_VISION_MODEL`, non-strict JSON Schema with images), OpenAI/Anthropic/Gemini image input, Telegram `getFile` downloads and the new persona's tone on real messages are covered by mocked tests only. Before relying on them, send a few real receipts (clear, blurry, with tax/service, a transfer proof) and a split caption to the production bot and compare the readings with the paper receipts.

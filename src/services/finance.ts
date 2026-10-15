@@ -9,6 +9,46 @@ import { enqueue } from "./queue";
 export function rupiah(amount: bigint | string) {
   return `Rp${BigInt(amount).toLocaleString("id-ID")}`;
 }
+export const expenseCategories = [
+  "food",
+  "transport",
+  "shopping",
+  "bills",
+  "housing",
+  "health",
+  "entertainment",
+  "education",
+  "business",
+  "savings",
+  "other",
+];
+export const incomeCategories = [
+  "salary",
+  "freelance",
+  "refund",
+  "other_income",
+];
+const categoryNames: Record<string, string> = {
+  food: "Makan & Minum",
+  transport: "Transportasi",
+  shopping: "Belanja",
+  bills: "Tagihan",
+  housing: "Rumah",
+  health: "Kesehatan",
+  entertainment: "Hiburan",
+  education: "Pendidikan",
+  business: "Bisnis",
+  savings: "Tabungan",
+  other: "Lainnya",
+  salary: "Gaji",
+  freelance: "Freelance",
+  refund: "Refund",
+  other_income: "Pemasukan lain",
+};
+// Custom categories keep the user's own wording.
+export function categoryLabel(category: string) {
+  return categoryNames[category] || category;
+}
 export function totals(
   rows: { type: string; amount: bigint; status?: string; category: string }[],
 ) {

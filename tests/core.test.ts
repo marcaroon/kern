@@ -67,6 +67,7 @@ describe("exact rupiah and validated intent", () => {
     expect(budgetUsage(100n, 100n, 80).exceeded).toBe(true);
   });
   it("works without optional AI credentials, without fabricated success", async () => {
+    vi.stubEnv("GROQ_API_KEY", "");
     vi.stubEnv("OPENAI_API_KEY", "");
     vi.stubEnv("OPENAI_MODEL", "");
     vi.stubEnv("ANTHROPIC_API_KEY", "");

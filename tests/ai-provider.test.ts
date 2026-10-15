@@ -1,11 +1,19 @@
 import { it, expect, vi, afterEach } from "vitest";
-const { parse, claudeParse, generate } = vi.hoisted(() => ({
-  parse: vi.fn(),
-  claudeParse: vi.fn(),
-  generate: vi.fn(),
-}));
+const { parse, claudeParse, generate, groqCreate, clientOptions } = vi.hoisted(
+  () => ({
+    groqCreate: vi.fn(),
+    clientOptions: vi.fn(),
+    parse: vi.fn(),
+    claudeParse: vi.fn(),
+    generate: vi.fn(),
+  }),
+);
 vi.mock("openai", () => ({
   default: class {
+    constructor(options: unknown) {
+      clientOptions(options);
+    }
+    chat = { completions: { create: groqCreate } };
     responses = { parse };
   },
 }));
@@ -20,8 +28,9 @@ vi.mock("@google/genai", async (original) => ({
     models = { generateContent: generate };
   },
 }));
-import { aiProvider, interpret, intent } from "@/services/ai";
-function only(provider: "openai" | "anthropic" | "gemini" | "") {
+import { aiProvider, interpret, intent, visionTarget } from "@/services/ai";
+import { readReceipt } from "@/services/receipts";
+function only(provider: "groq" | "openai" | "anthropic" | "gemini" | "") {
   for (const name of [
     "OPENAI_API_KEY",
     "OPENAI_MODEL",
@@ -30,8 +39,16 @@ function only(provider: "openai" | "anthropic" | "gemini" | "") {
     "GEMINI_API_KEY",
     "GEMINI_MODEL",
     "AI_PROVIDER",
+    "GROQ_API_KEY",
+    "GROQ_MODEL",
+    "GROQ_VISION_MODEL",
+    "AI_VISION_PROVIDER",
   ])
     vi.stubEnv(name, "");
+  if (provider === "groq") {
+    vi.stubEnv("GROQ_API_KEY", "test-only");
+    vi.stubEnv("GROQ_MODEL", "openai/gpt-oss-20b");
+  }
   if (provider === "openai") {
     vi.stubEnv("OPENAI_API_KEY", "test-only");
     vi.stubEnv("OPENAI_MODEL", "test-only");
@@ -48,6 +65,101 @@ function only(provider: "openai" | "anthropic" | "gemini" | "") {
 const gemini = (finishReason: string, body: unknown) => ({
   candidates: [{ finishReason }],
   text: typeof body === "string" ? body : JSON.stringify(body),
+});
+it("uses Groq's server endpoint and strict schema with exact IDR validation", async () => {
+  only("groq");
+  expect(aiProvider()).toBe("groq");
+  const body = intent("create_transaction", {
+    type: "expense",
+    amount: "35000",
+    currency: "IDR",
+  });
+  groqCreate.mockResolvedValue({
+    choices: [
+      { finish_reason: "stop", message: { content: JSON.stringify(body) } },
+    ],
+  });
+  expect(await interpret("makan 35rb")).toEqual(body);
+  expect(clientOptions).toHaveBeenCalledWith(
+    expect.objectContaining({
+      baseURL: "https://api.groq.com/openai/v1",
+      timeout: 20000,
+      maxRetries: 0,
+    }),
+  );
+  expect(groqCreate.mock.calls[0][0].response_format).toMatchObject({
+    type: "json_schema",
+    json_schema: { strict: true, schema: { additionalProperties: false } },
+  });
+  expect((await interpret("makan 20rb")).intent).toBe("clarify");
+  vi.stubEnv("AI_PROVIDER", "groq");
+  vi.stubEnv("GROQ_API_KEY", "");
+  vi.stubEnv("OPENAI_API_KEY", "test-only");
+  vi.stubEnv("OPENAI_MODEL", "test-only");
+  expect(aiProvider()).toBeNull();
+});
+it("falls back safely on Groq refusal, truncation, invalid output and outage", async () => {
+  only("groq");
+  groqCreate
+    .mockResolvedValueOnce({
+      choices: [
+        {
+          finish_reason: "length",
+          message: { content: JSON.stringify(intent("help")) },
+        },
+      ],
+    })
+    .mockResolvedValueOnce({
+      choices: [
+        { finish_reason: "stop", message: { refusal: "no", content: "{}" } },
+      ],
+    })
+    .mockResolvedValueOnce({
+      choices: [{ finish_reason: "stop", message: { content: "not JSON" } }],
+    })
+    .mockResolvedValueOnce({
+      choices: [
+        {
+          finish_reason: "stop",
+          message: { content: '{"intent":"execute_sql"}' },
+        },
+      ],
+    })
+    .mockRejectedValueOnce(new Error("simulated 429"));
+  for (let i = 0; i < 4; i++)
+    expect((await interpret("pesan ambigu")).intent).toBe("clarify");
+  expect((await interpret("pengeluaran 35000 makan")).intent).toBe(
+    "create_transaction",
+  );
+});
+it("rejects account names and invented account IDs from the model", async () => {
+  only("groq");
+  for (const accountId of [
+    "Bank Contoh",
+    "11111111-1111-4111-8111-111111111111",
+  ]) {
+    groqCreate.mockResolvedValueOnce({
+      choices: [
+        {
+          finish_reason: "stop",
+          message: {
+            content: JSON.stringify(
+              intent("create_transaction", {
+                type: "expense",
+                amount: "50000",
+                currency: "IDR",
+                title: "Buku",
+                accountId,
+              }),
+            ),
+          },
+        },
+      ],
+    });
+    const result = await interpret("beli buku 50rb pakai QRIS Bank Contoh");
+    expect(result.intent).toBe("clarify");
+    expect(result.entities.answer).toContain("rekening");
+  }
 });
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -187,4 +299,121 @@ it("falls back when Gemini blocks, truncates, returns bad JSON or fails", async 
   for (const text of ["x", "y", "z"])
     expect((await interpret(text)).intent).toBe("clarify");
   expect((await interpret("Bantuan")).intent).toBe("help");
+});
+const receiptBody = {
+  is_receipt: true,
+  type: "expense",
+  merchant: "Kopi Kenangan",
+  date: null,
+  currency: "IDR",
+  items: [{ name: "Kopi susu", quantity: 1, amount: "22000" }],
+  subtotal: null,
+  tax: null,
+  service: null,
+  discount: null,
+  total: "22000",
+  payment_method: null,
+  category: "food",
+  problem: null,
+};
+const image = { data: Buffer.from("fake-jpeg"), mime: "image/jpeg" };
+it("needs an explicit Groq vision model and can use another vision provider", () => {
+  only("groq");
+  expect(visionTarget()).toBeNull();
+  vi.stubEnv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b");
+  expect(visionTarget()).toEqual({
+    provider: "groq",
+    model: "qwen/qwen3.8-27b",
+  });
+  vi.stubEnv("GEMINI_API_KEY", "test-only");
+  vi.stubEnv("GEMINI_MODEL", "gemini-test");
+  vi.stubEnv("AI_VISION_PROVIDER", "gemini");
+  expect(visionTarget()).toEqual({ provider: "gemini", model: "gemini-test" });
+  vi.stubEnv("GEMINI_API_KEY", "");
+  // An explicit but unconfigured vision provider never silently switches vendors.
+  expect(visionTarget()).toBeNull();
+});
+it("sends receipt photos inline to Groq and validates the reading", async () => {
+  only("groq");
+  vi.stubEnv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b");
+  groqCreate.mockResolvedValueOnce({
+    choices: [
+      {
+        finish_reason: "stop",
+        message: {
+          content: `<think>reading</think>${JSON.stringify(receiptBody)}`,
+        },
+      },
+    ],
+  });
+  expect(await readReceipt(image, "kopi pagi")).toMatchObject({
+    merchant: "Kopi Kenangan",
+    total: "22000",
+  });
+  const request = groqCreate.mock.calls[0][0];
+  expect(request.model).toBe("qwen/qwen3.8-27b");
+  expect(request.response_format.json_schema.strict).toBe(false);
+  const content = request.messages[1].content;
+  expect(content[1].image_url.url).toBe(
+    `data:image/jpeg;base64,${image.data.toString("base64")}`,
+  );
+  // The caption is passed as context, never as the system prompt.
+  expect(request.messages[0].content).not.toContain("kopi pagi");
+  groqCreate.mockResolvedValueOnce({
+    choices: [{ finish_reason: "stop", message: { content: '{"sql":1}' } }],
+  });
+  await expect(readReceipt(image, "")).rejects.toThrow("gagal membaca");
+});
+it("sends receipt photos to Gemini as inline data", async () => {
+  only("gemini");
+  generate.mockResolvedValueOnce(gemini("STOP", receiptBody));
+  await readReceipt(image, "");
+  const request = generate.mock.calls[0][0];
+  expect(request.contents[0].parts[0].inlineData).toEqual({
+    mimeType: "image/jpeg",
+    data: image.data.toString("base64"),
+  });
+  expect(request.config.responseJsonSchema).not.toHaveProperty("$schema");
+});
+it("passes recent turns and accepts amounts the user stated earlier only", async () => {
+  only("groq");
+  const body = intent("create_transaction", {
+    type: "expense",
+    amount: "45000",
+    currency: "IDR",
+    title: "Makan siang",
+  });
+  const reply = (value: unknown) => ({
+    choices: [
+      { finish_reason: "stop", message: { content: JSON.stringify(value) } },
+    ],
+  });
+  groqCreate.mockResolvedValueOnce(reply(body));
+  const history = [
+    { user: "pengeluaran 45rb", reply: "Buat apa pengeluarannya?" },
+  ];
+  expect(
+    await interpret("makan siang", new Date(), "Asia/Jakarta", history),
+  ).toEqual(body);
+  const text = groqCreate.mock.calls[0][0].messages[1].content;
+  expect(text).toContain("<riwayat>");
+  expect(text).toContain("<pesan_baru>\nmakan siang");
+  // An amount that only KERN mentioned is never accepted as the user's.
+  groqCreate.mockResolvedValueOnce(reply(body));
+  expect(
+    (
+      await interpret("catat yang itu", new Date(), "Asia/Jakarta", [
+        { user: "berapa total minggu ini?", reply: "Total Rp45.000" },
+      ])
+    ).intent,
+  ).toBe("clarify");
+  // A foreign currency in an unrelated earlier message does not block rupiah.
+  groqCreate.mockResolvedValueOnce(reply(body));
+  expect(
+    (
+      await interpret("makan siang 45rb", new Date(), "Asia/Jakarta", [
+        { user: "langganan 10 dolar", reply: null },
+      ])
+    ).intent,
+  ).toBe("create_transaction");
 });

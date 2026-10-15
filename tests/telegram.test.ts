@@ -1,5 +1,7 @@
 import { it, expect, vi, afterEach, beforeEach } from "vitest";
 import {
+  downloadTelegramImage,
+  messageImage,
   setupReplies,
   telegramMode,
   telegramSender,
@@ -119,4 +121,80 @@ it("tells private senders their own ID only while no owner is configured", async
     await setupReplies(updates, ["1001"], transport as unknown as typeof fetch),
   ).toBe(0);
   expect(transport).toHaveBeenCalledTimes(1);
+});
+it("downloads a receipt image without exposing the token in errors", async () => {
+  const urls: string[] = [];
+  const transport = vi.fn(async (url: string) => {
+    urls.push(url);
+    return url.endsWith("/getFile")
+      ? new Response(
+          JSON.stringify({
+            ok: true,
+            result: { file_path: "photos/file_1.jpg", file_size: 5 },
+          }),
+        )
+      : new Response("bytes");
+  });
+  const data = await downloadTelegramImage(
+    "abc",
+    transport as unknown as typeof fetch,
+  );
+  expect(data.toString()).toBe("bytes");
+  expect(urls[1]).toBe(
+    "https://api.telegram.org/file/bot123:secret-token/photos/file_1.jpg",
+  );
+  for (const broken of [
+    vi.fn(async () => new Response("{}", { status: 400 })),
+    vi.fn(async () => {
+      throw new Error("https://api.telegram.org/bot123:secret-token/getFile");
+    }),
+  ]) {
+    const error = await downloadTelegramImage(
+      "abc",
+      broken as unknown as typeof fetch,
+    ).catch((e) => e);
+    expect(error.code).toBe("TELEGRAM_FILE_UNAVAILABLE");
+    expect(`${error.message}${error.code}`).not.toContain("secret-token");
+  }
+  const huge = vi.fn(
+    async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          result: { file_path: "photos/x.jpg", file_size: 50_000_000 },
+        }),
+      ),
+  );
+  expect(
+    (
+      await downloadTelegramImage("abc", huge as unknown as typeof fetch).catch(
+        (e) => e,
+      )
+    ).code,
+  ).toBe("IMAGE_TOO_LARGE");
+});
+it("accepts image documents and refuses other files", () => {
+  const base = {
+    message_id: 1,
+    date: 1,
+    chat: { id: 1, type: "private" },
+  };
+  expect(
+    messageImage({
+      ...base,
+      document: { file_id: "d", mime_type: "image/png", file_size: 10 },
+    }),
+  ).toEqual({ fileId: "d", mime: "image/png" });
+  expect(
+    messageImage({
+      ...base,
+      document: { file_id: "d", mime_type: "application/pdf" },
+    }),
+  ).toBeNull();
+  expect(
+    messageImage({
+      ...base,
+      document: { file_id: "d", mime_type: "image/jpeg", file_size: 9e6 },
+    }),
+  ).toBe("too_large");
 });
