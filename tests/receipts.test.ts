@@ -146,6 +146,7 @@ describe("split bill", () => {
         { item: 1, people: ["Aku"] },
         { item: 2, people: ["budi"] },
       ],
+      payer: null,
       question: null,
     });
     expect(shares.map((s) => [s.name, s.amount])).toEqual([
@@ -168,6 +169,7 @@ describe("split bill", () => {
         { item: 1, people: ["Sari"] },
         { item: 99, people: ["Budi"] },
       ],
+      payer: null,
       question: null,
     });
     expect(shares.reduce((a, s) => a + s.amount, 0n)).toBe(45000n);
@@ -178,6 +180,7 @@ describe("split bill", () => {
       splitBill(receipt, {
         participants: ["Kamu"],
         assignments: [],
+        payer: null,
         question: null,
       }),
     ).toThrow("Dibagi ke siapa");
@@ -258,5 +261,14 @@ describe("untrusted model output", () => {
         zone,
       ),
     ).not.toThrow();
+  });
+});
+describe("fallback for new features", () => {
+  it("understands debt, bill and insight questions without AI", () => {
+    expect(fallback("siapa aja yang masih utang?").intent).toBe("list_debts");
+    expect(fallback("tagihan bulan ini").intent).toBe("list_bills");
+    expect(fallback("gimana keuanganku bulan ini?").intent).toBe(
+      "finance_insight",
+    );
   });
 });

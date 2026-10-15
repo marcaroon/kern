@@ -1,6 +1,7 @@
 import type { Tx } from "@/lib/db";
 import { dateRange, displayDate } from "@/lib/time";
-import { financeSummary, budgetStatus, rupiah } from "./finance";
+import { financeSummary, budgetStatus, categoryLabel, rupiah } from "./finance";
+import { financeInsights } from "./insights";
 export async function dashboard(
   tx: Tx,
   ownerId: string,
@@ -85,7 +86,7 @@ export async function report(
   zone = "Asia/Jakarta",
 ) {
   const range = dateRange(kind === "weekly" ? "week" : "today", now, zone);
-  const [money, tasks, completed, notes, reminders, budgets] =
+  const [money, tasks, completed, notes, reminders, budgets, insights] =
     await Promise.all([
       financeSummary(
         tx,
@@ -121,7 +122,12 @@ export async function report(
         take: 5,
       }),
       budgetStatus(tx, ownerId, now, zone),
+      financeInsights(tx, ownerId, now, zone),
     ]);
+  // Mornings show only what needs attention; the weekly review shows everything.
+  const shown = insights.filter(
+    (i) => kind === "weekly" || i.level === "alert",
+  );
   return [
     kind === "weekly"
       ? "Review mingguan KERN"
@@ -131,8 +137,11 @@ export async function report(
     `Berdasarkan data yang dicatat (${displayDate(range.start, zone)}).`,
     `Pemasukan ${rupiah(money.income)}; pengeluaran ${rupiah(money.expense)} (${money.count} transaksi).`,
     ...Object.entries(money.categories).map(
-      ([name, amount]) => `${name}: ${rupiah(amount)}`,
+      ([name, amount]) => `${categoryLabel(name)}: ${rupiah(amount)}`,
     ),
+    ...(shown.length
+      ? ["", "Insight keuangan:", ...shown.map((i) => i.text), ""]
+      : []),
     `Task selesai: ${completed}. Prioritas terbuka (maks. 15):`,
     ...tasks.map(
       (t) =>
@@ -144,7 +153,11 @@ export async function report(
     ),
     ...budgets
       .filter((b) => b.warning)
-      .map((b) => `Anggaran ${b.category}: ${b.percent}% digunakan.`),
+      .filter(() => !insights.length)
+      .map(
+        (b) =>
+          `Anggaran ${categoryLabel(b.category)}: ${b.percent}% digunakan.`,
+      ),
     ...notes.map((n) => `Catatan: ${n.title}`),
     "Data ini hanya mencakup aktivitas yang disimpan di KERN.",
   ]

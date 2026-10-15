@@ -79,7 +79,7 @@ The full development dependency audit reports five high-severity entries in the 
 
 ## Known product boundaries
 
-One owner, text messages and receipt photos, keyword memory and one action per message. Conversation context covers the last 30 minutes only. Dashboard timezone is WIB. Missing/uncertain provider deliveries need operator configuration/reconciliation. The managed Sheets tab requires fixed rows. Split bills record only the owner's share; amounts owed by friends are shown, not tracked. Voice, Calendar, email and semantic retrieval are roadmap features, not implemented capabilities.
+One owner, text messages and receipt photos, keyword memory and one action per message. Conversation context covers the last 30 minutes only. Dashboard timezone is WIB. Missing/uncertain provider deliveries need operator configuration/reconciliation. The managed Sheets tab requires fixed rows. Split bills record the owner's share as an expense and friends' shares as debts; settling a debt is not income. Voice, Calendar, email and semantic retrieval are roadmap features, not implemented capabilities.
 
 ## Friendlier chat, receipts and split bill (15 October 2026)
 
@@ -96,3 +96,11 @@ The first two real receipt photos sent to production failed. Reproduced locally 
 - Telegram `getFile` and file downloads from this machine took 0.6–10 s and once hit a 16 s connect timeout.
 
 After the fixes (stricter prompt, nullable amounts, last-number parsing, never-throwing normalisation, provider fallback list, one short 429 retry, download retry, tolerant date parsing), qwen read the first photo of the Sate Balibul receipt correctly four times and the second photo once (two other attempts on it within the same minute were rate limited), and `gemini-3.5-flash-lite` read each photo correctly once: five items summing to Rp154.000, total Rp154.000, category food, printed date 1 Oct 2026 18:08. One qwen run noted a cut-off bottom edge as a problem; one Gemini run also read the payment method "Tunai". This is two photos of one receipt; other layouts (tax/service lines, e-wallet proofs, long receipts) remain untested. All 100 tests, lint, typecheck, Prettier, build and migration checks passed.
+
+## Buttons, debts, bills and insights (15 October 2026)
+
+Migration `202610150002_debts_bills` adds `Debt` and `Bill` (RLS enabled, CHECK constraints on direction, amounts and due day). 112 tests, lint, strict typecheck, Prettier, production build and `npm run test:migrations` passed. Tests cover button payloads, owner-only and duplicate taps, cancelling the tapped proposal, atomic split-bill debts, partial and over-payment, direction ambiguity, nudge idempotency, bill reminder stages and the 09:00 rule, double payment, variable amounts, day-31 clamping, insight arithmetic and the text/vision provider chains.
+
+Live intent check against Groq `openai/gpt-oss-20b` with synthetic sentences: debt creation (both directions after a prompt fix), settlement with a partial amount, debt listing, fixed and variable bill creation, bill payment and the insight question were classified correctly; "Sari aku talangin makan 45rb" produced a clarifying question. Several requests in a burst hit Groq's 8,000 tokens-per-minute limit, which led to the provider chain and the honest rate-limit reply.
+
+**Not verified live:** Telegram inline buttons and callback delivery (requires re-registering the webhook with `callback_query`), debt nudges and bill reminders arriving through the production scheduler, and insight wording on real data.

@@ -3,6 +3,7 @@ import { constantEqual, bodyJson, rateLimit } from "@/lib/security";
 import { db } from "@/lib/db";
 import { ownerId, allowedTelegramIds } from "@/lib/config";
 import {
+  acknowledgeCallbacks,
   ingestUpdates,
   setupReplies,
   telegramMode,
@@ -31,6 +32,7 @@ export function receiveTelegram(request: Request) {
       allowedTelegramIds(),
     );
     await setupReplies([update], allowedTelegramIds());
+    await acknowledgeCallbacks([update], allowedTelegramIds());
     // The message is durably stored; a processing failure is retried by the
     // scheduled dispatch, so Telegram still receives success and does not resend.
     if (result.accepted)

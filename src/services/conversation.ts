@@ -12,6 +12,21 @@ import {
   rupiah,
 } from "./finance";
 import { latestPending, propose } from "./pending";
+import {
+  debtInput,
+  listDebts,
+  saveDebt,
+  settleDebts,
+  settledText,
+} from "./debts";
+import {
+  billSavedText,
+  cancelBill,
+  listBills,
+  payBill,
+  saveBill,
+} from "./bills";
+import { insightText } from "./insights";
 import { handleSplitRequest, receiptDeps, type ReceiptDeps } from "./receipts";
 import { saveTask, saveNote, saveReminder, resolveMatch } from "./records";
 import { report } from "./reporting";
@@ -30,12 +45,19 @@ const destructive = new Set([
   "update_note",
   "archive_note",
   "set_budget",
+  "settle_debt",
+  "cancel_bill",
 ]);
+// Confirmed intents that act on a person or a bill name instead of a stored record.
+const untargeted = new Set(["set_budget", "settle_debt", "cancel_bill"]);
 const help = [
   "Hai! 👋 Aku KERN, asisten pribadimu. Ngobrol aja kayak biasa, misalnya:",
   "💸 “makan siang 35rb pakai QRIS” atau “gajian 8jt”",
   "🧾 Kirim foto nota/struk, nanti aku baca dan catat",
   "🍕 Foto nota + caption “split bill: aku nasi goreng, Budi mie ayam”, atau “split 300rb bagi 3”",
+  "🤝 “Budi minjem 50rb buat tiket” · “Budi udah bayar” · “siapa aja yang masih utang?”",
+  "🔔 “tagihan internet 350rb tiap tanggal 5” · “tagihan bulan ini”",
+  "📈 “gimana keuanganku bulan ini?”",
   "✅ “tambah task revisi dashboard”",
   "⏰ “ingatkan besok jam 9 pagi buat follow up vendor”",
   "💡 “catat ide: SaaS klinik hewan”",
@@ -88,6 +110,13 @@ const labels: Record<string, string> = {
   in_progress: "sedang dikerjakan",
   completed: "selesai",
   cancelled: "dibatalkan",
+  settle_debt: "catat pelunasan utang",
+  cancel_bill: "hapus tagihan rutin",
+  person: "Orang",
+  direction: "Arah",
+  day: "Tanggal",
+  owed_to_me: "dia utang ke kamu",
+  i_owe: "kamu utang ke dia",
 };
 
 async function resolveTarget(tx: Tx, ownerId: string, input: Intent) {
@@ -169,7 +198,7 @@ export async function executeIntent(
     !confirmed
   ) {
     const target =
-      input.intent === "set_budget" || input.intent.startsWith("create_")
+      untargeted.has(input.intent) || input.intent.startsWith("create_")
         ? null
         : await resolveTarget(tx, ownerId, input);
     if (target) e.id = target.id;
@@ -189,7 +218,7 @@ export async function executeIntent(
       )
       .map(
         ([key, value]) =>
-          `${labels[key] || key}: ${key === "amount" ? rupiah(String(value)) : key === "date" ? displayDate(new Date(String(value)), zone) : Array.isArray(value) ? value.join(", ") : ["type", "recurrence", "status"].includes(key) ? labels[String(value)] || String(value) : String(value)}`,
+          `${labels[key] || key}: ${key === "amount" ? rupiah(String(value)) : key === "date" ? displayDate(new Date(String(value)), zone) : Array.isArray(value) ? value.join(", ") : ["type", "recurrence", "status", "direction"].includes(key) ? labels[String(value)] || String(value) : String(value)}`,
       )
       .join("\n");
     return `Aku akan ${labels[input.intent] || "menjalankan permintaan ini"}${target ? `: “${target.title}”` : ""}. Sudah sesuai?\n${changes.slice(0, 2500)}\nBelum aku ubah. Balas “ya” untuk lanjut atau “batal” (berlaku 10 menit).\nKode konfirmasi: ${pending.id}`;
@@ -203,6 +232,72 @@ export async function executeIntent(
       );
     case "split_bill":
       return handleSplitRequest(tx, ownerId, input, now, deps);
+    case "create_debt": {
+      if (e.currency && e.currency !== "IDR")
+        return "Aku cuma bisa mencatat utang dalam rupiah. Boleh tulis nominal rupiahnya?";
+      if (!e.person || !e.direction || !e.amount)
+        return "Siapa yang utang ke siapa, dan berapa? Contoh: “Budi minjem 50rb buat tiket” atau “aku utang 100rb ke Sari”.";
+      const row = await saveDebt(
+        tx,
+        ownerId,
+        {
+          person: e.person,
+          direction: e.direction,
+          amount: e.amount,
+          description: e.title || e.content || "pinjaman",
+        },
+        now,
+      );
+      return row.direction === "owed_to_me"
+        ? `📝 Dicatat: ${row.person} utang ${rupiah(row.amount)} ke kamu (${row.description}). Nanti aku ingatkan kalau belum kembali dalam 3 hari.`
+        : `📝 Dicatat: kamu utang ${rupiah(row.amount)} ke ${row.person} (${row.description}). Aku ingatkan biar nggak lupa bayar.`;
+    }
+    case "settle_debt":
+      return settledText(
+        await settleDebts(
+          tx,
+          ownerId,
+          { person: e.person, direction: e.direction, amount: e.amount },
+          now,
+        ),
+      );
+    case "list_debts":
+      return listDebts(tx, ownerId, e.direction, now);
+    case "create_bill": {
+      if (!e.title || !e.day)
+        return "Tagihan apa dan tiap tanggal berapa? Contoh: “tagihan internet 350rb tiap tanggal 5”.";
+      return billSavedText(
+        await saveBill(
+          tx,
+          ownerId,
+          {
+            name: e.title,
+            amount: e.amount,
+            dueDay: e.day,
+            category: e.category || "bills",
+            paymentMethod: e.paymentMethod,
+          },
+          now,
+          zone,
+        ),
+        zone,
+      );
+    }
+    case "pay_bill":
+      return payBill(
+        tx,
+        ownerId,
+        { name: e.title || e.query, amount: e.amount },
+        messageId,
+        now,
+        zone,
+      );
+    case "list_bills":
+      return listBills(tx, ownerId, now, zone);
+    case "cancel_bill":
+      return cancelBill(tx, ownerId, e.title || e.query);
+    case "finance_insight":
+      return insightText(tx, ownerId, now, zone);
     case "create_transaction": {
       if (e.currency !== "IDR")
         return "Aku cuma bisa mencatat dalam rupiah (IDR). Boleh tulis nominal rupiahnya?";
@@ -513,11 +608,15 @@ export async function confirmAction(
     .object({
       intent: intentSchema.optional(),
       targetUpdatedAt: z.string().nullable().optional(),
+      // Split bills also record who owes whom, atomically with the user's share.
+      debts: z.array(debtInput).max(20).optional(),
     })
     .parse(pending.payload);
   if (!payload.intent) {
     await tx.pendingAction.update({ where: { id }, data: { consumedAt: now } });
-    return "Oke 👍";
+    if (!payload.debts?.length) return "Oke 👍";
+    for (const debt of payload.debts) await saveDebt(tx, ownerId, debt, now);
+    return `✅ ${debtsText(payload.debts)}`;
   }
   if (payload.targetUpdatedAt) {
     const target = await resolveTarget(tx, ownerId, payload.intent);
@@ -529,7 +628,49 @@ export async function confirmAction(
     data: { consumedAt: now },
   });
   if (!consumed.count) return "Konfirmasi sudah digunakan.";
-  return executeIntent(tx, ownerId, payload.intent, messageId, now, zone, true);
+  const reply = await executeIntent(
+    tx,
+    ownerId,
+    payload.intent,
+    messageId,
+    now,
+    zone,
+    true,
+  );
+  if (!payload.debts?.length) return reply;
+  for (const debt of payload.debts) await saveDebt(tx, ownerId, debt, now);
+  return `${reply}\n${debtsText(payload.debts)}`;
+}
+function debtsText(
+  debts: { person: string; direction: string; amount: string }[],
+) {
+  const owed = debts.filter((d) => d.direction === "owed_to_me");
+  const mine = debts.filter((d) => d.direction === "i_owe");
+  return [
+    ...(owed.length
+      ? [
+          `Piutang dicatat: ${owed.map((d) => `${d.person} ${rupiah(d.amount)}`).join(", ")}. Aku ingatkan kalau belum dibayar dalam 3 hari.`,
+        ]
+      : []),
+    ...mine.map(
+      (d) => `Utangmu ke ${d.person} ${rupiah(d.amount)} juga aku catat.`,
+    ),
+  ].join("\n");
+}
+// "batal <id>" from a button cancels that specific proposal.
+export async function cancelProposal(
+  tx: Tx,
+  ownerId: string,
+  id: string,
+  now: Date,
+) {
+  const cancelled = await tx.pendingAction.updateMany({
+    where: { id, ownerId, consumedAt: null, expiresAt: { gt: now } },
+    data: { consumedAt: now },
+  });
+  return cancelled.count
+    ? "Oke, nggak jadi. Belum ada yang aku ubah."
+    : "Pertanyaan itu sudah nggak berlaku, jadi nggak ada yang berubah.";
 }
 
 // "ya" / "batal" answer the latest open proposal. Null means none is open, so the

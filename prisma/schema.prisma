@@ -207,3 +207,43 @@ model Heartbeat {
   name String   @id
   at   DateTime @db.Timestamptz(3)
 }
+
+// Money people owe the owner (owed_to_me) or the owner owes them (i_owe).
+// Settling a debt is not income or expense; only the owner's own share is.
+model Debt {
+  id          String    @id @default(uuid())
+  ownerId     String
+  person      String
+  direction   String
+  amount      BigInt
+  paid        BigInt    @default(0)
+  description String
+  status      String    @default("open")
+  nextNudgeAt DateTime? @db.Timestamptz(3)
+  nudges      Int       @default(0)
+  settledAt   DateTime? @db.Timestamptz(3)
+  createdAt   DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@index([ownerId, status])
+  @@index([status, nextNudgeAt])
+}
+
+// Monthly recurring bill; amount null means it varies and is asked when paid.
+model Bill {
+  id            String    @id @default(uuid())
+  ownerId       String
+  name          String
+  amount        BigInt?
+  category      String    @default("bills")
+  paymentMethod String?
+  dueDay        Int
+  nextDueAt     DateTime  @db.Timestamptz(3)
+  status        String    @default("active")
+  lastPaidAt    DateTime? @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@index([ownerId, status])
+  @@index([status, nextDueAt])
+}

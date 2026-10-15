@@ -32,6 +32,14 @@ export const intentSchema = z.object({
     "daily_review",
     "weekly_review",
     "split_bill",
+    "create_debt",
+    "settle_debt",
+    "list_debts",
+    "create_bill",
+    "pay_bill",
+    "list_bills",
+    "cancel_bill",
+    "finance_insight",
     "help",
     "general",
     "clarify",
@@ -61,6 +69,9 @@ export const intentSchema = z.object({
     tags: z.array(z.string()).nullable(),
     period: z.enum(["today", "week", "month", "previous_month"]).nullable(),
     month: z.string().nullable(),
+    person: z.string().nullable(),
+    direction: z.enum(["owed_to_me", "i_owe"]).nullable(),
+    day: z.number().int().min(1).max(31).nullable(),
     answer: z.string().nullable(),
   }),
 });
@@ -97,6 +108,9 @@ export function intent(
       tags: null,
       period: null,
       month: null,
+      person: null,
+      direction: null,
+      day: null,
       answer: null,
       ...entities,
     },
@@ -203,6 +217,20 @@ export function fallback(
     return intent("search_notes", { category: "idea" });
   const search = text.match(/^cari catatan[: ]+(.+)$/i);
   if (search) return intent("search_notes", { query: search[1] });
+  if (
+    /^(siapa (aja )?yang (masih )?(utang|ngutang)|daftar (utang|piutang)|utang(ku)? (siapa|ke siapa))/.test(
+      lower,
+    )
+  )
+    return intent("list_debts");
+  if (/^(daftar )?tagihan( (rutin|bulan ini|apa aja))?\??$/.test(lower))
+    return intent("list_bills");
+  if (
+    /^(insight|analisis) keuangan|boros (gak|nggak|ga)|gimana keuangan/.test(
+      lower,
+    )
+  )
+    return intent("finance_insight");
   if (/\b(split|patungan|bagi rata|bagi \d+)\b/.test(lower)) {
     // Head counts ("bagi 3", "4 orang") are not amounts.
     const amounts = amountsIn(
@@ -237,39 +265,41 @@ function readyProviders(): Record<AiProvider, boolean> {
     gemini: configured("GEMINI_API_KEY", "GEMINI_MODEL"),
   };
 }
-function chosenProvider(variable: string) {
-  const ready = readyProviders();
-  const chosen = process.env[variable]?.trim().toLowerCase();
-  if (chosen) {
-    const match = providers.find((p) => p === chosen);
-    return match && ready[match] ? match : null;
-  }
-  return undefined;
-}
-// AI_PROVIDER selects explicitly; otherwise the first fully configured provider is used.
-export function aiProvider(): AiProvider | null {
-  const chosen = chosenProvider("AI_PROVIDER");
-  if (chosen !== undefined) return chosen;
-  const ready = readyProviders();
-  return providers.find((p) => ready[p]) ?? null;
-}
-// Receipt photos may use another provider (AI_VISION_PROVIDER) and model (<P>_VISION_MODEL).
 // A comma-separated list ("groq,gemini") is tried in order, so a rate-limited free
-// tier can fall back to another configured provider.
-export function visionTargets(): { provider: AiProvider; model: string }[] {
-  const listed = (process.env.AI_VISION_PROVIDER || "")
+// tier can fall back to another configured provider. Listed providers that are not
+// fully configured are skipped; they never silently switch to an unlisted vendor.
+function listedProviders(variable: string): AiProvider[] | null {
+  const listed = (process.env[variable] || "")
     .split(",")
     .map((p) => p.trim().toLowerCase())
     .filter(Boolean);
+  if (!listed.length) return null;
   const ready = readyProviders();
-  const chosen = listed.length
-    ? listed.map((name) => providers.find((p) => p === name && ready[p]))
-    : [aiProvider()];
+  return [
+    ...new Set(
+      listed.flatMap((name) => providers.filter((p) => p === name && ready[p])),
+    ),
+  ];
+}
+// AI_PROVIDER selects explicitly; otherwise the first fully configured provider is used.
+export function aiProviders(): AiProvider[] {
+  const listed = listedProviders("AI_PROVIDER");
+  if (listed) return listed;
+  const ready = readyProviders();
+  const first = providers.find((p) => ready[p]);
+  return first ? [first] : [];
+}
+export function aiProvider(): AiProvider | null {
+  return aiProviders()[0] ?? null;
+}
+// Receipt photos may use other providers (AI_VISION_PROVIDER) and models
+// (<P>_VISION_MODEL); empty uses the text providers.
+export function visionTargets(): { provider: AiProvider; model: string }[] {
   const targets: { provider: AiProvider; model: string }[] = [];
-  for (const provider of chosen) {
-    const model = provider && visionModelFor(provider);
-    if (provider && model && !targets.some((t) => t.provider === provider))
-      targets.push({ provider, model });
+  for (const provider of listedProviders("AI_VISION_PROVIDER") ??
+    aiProviders()) {
+    const model = visionModelFor(provider);
+    if (model) targets.push({ provider, model });
   }
   return targets;
 }
@@ -284,6 +314,9 @@ function instructions(now: Date, zone: string) {
     "Safety: never invent amounts, IDs, account IDs or memories. Amounts must be stated by the user (newest message or earlier user turns). accountId and toAccountId must be UUIDs the user wrote, otherwise null. Bank names such as BCA are not account IDs: keep a named bank in paymentMethod (e.g. QRIS BCA) for income/expense; transfers without two explicit account IDs need clarification.",
     "Fields: create_transaction requires a short nonempty title describing the purchase or source, type, amount and currency IDR for rupiah/rb/ribu/jt. amount is a decimal integer string. Use null for absent fields; missing required fields go in missing_fields with intent clarify. Transaction date may be null for today; reminders need an explicit time. Dates are ISO with offset; besok is tomorrow, lusa is the day after, weeks start Monday. Ambiguous currency/type/date/amount or several actions in one message require clarify. Categories: food/transport/shopping/bills/housing/health/entertainment/education/business/savings/other, or salary/freelance/refund/other_income for income.",
     "split_bill: the user wants to split a bill or receipt (split, patungan, bagi rata, bayarin, masing-masing). Put the complete splitting instruction in content (who had what, how many people), merging corrections with earlier split instructions from the history (e.g. 'Budi juga minum es teh' adds to the earlier assignment); amount only if the user states the total in this text, title for what it was. A receipt photo sent just before may be the bill.",
+    "Debts (utang/piutang, minjem, pinjam, nalangin, talangin): create_debt when someone owes the user (direction owed_to_me, e.g. 'Budi minjem 50rb') or the user owes someone (i_owe, e.g. 'aku utang 100rb ke Sari'); person is the other person's name (never the user), title what it was for. direction is always required for create_debt: i_owe when the user borrowed or owes (aku/saya/gue utang/minjem/pinjam ke X, ditalangin X), owed_to_me when the other person borrowed or owes the user (X minjem/utang ke aku, aku talangin X). settle_debt when a debt is paid back fully or partly ('Budi udah bayar', 'Budi transfer 20rb', 'aku udah bayar ke Sari'); amount only if a partial amount is stated. list_debts for who owes whom; direction optional. Debts are not income or expense.",
+    "Bills: create_bill for a recurring monthly bill or subscription ('tagihan internet 350rb tiap tanggal 5', 'Netflix 65rb tiap tgl 12'); title is the bill name, day the due day 1-31, amount null when it varies (listrik). pay_bill when the user paid one ('udah bayar internet', 'internet udah dibayar', 'bayar listrik 450rb'); title is the bill name; amount only if stated. A short message naming a bill as paid is pay_bill, not clarify. list_bills for upcoming bills; cancel_bill to stop one (requires confirmation).",
+    "finance_insight: questions about how the user's money is doing, spending habits, whether they are overspending, remaining budget per day.",
     "Records: match tasks/notes by query if no explicit UUID. Updates, cancellation, archiving, budget changes and financial corrections require confirmation. For finance questions choose a period. Personal questions about stored data use the database intents, never general.",
     "general: greetings, thanks, small talk and general questions. Answer helpfully and to the point (usually 1-4 sentences, up to about 120 words for advice), never claim a stored fact or a completed action, and do not infer personal data. Mention that advice is general when it matters (money, health, law).",
     "clarify: ask one specific, friendly question about what is missing. The user can simply reply; do not ask them to resend everything. Nothing is saved yet.",
@@ -501,49 +534,65 @@ export async function interpret(
   zone = "Asia/Jakarta",
   history: Turn[] = [],
 ): Promise<Intent> {
-  const provider = aiProvider();
-  if (!provider) return fallback(text, now, zone);
-  try {
-    const parsed = intentSchema.parse(
-      await structured({
-        provider,
-        model: modelFor(provider),
-        system: instructions(now, zone),
-        text: withHistory(text.slice(0, 6000), history),
-        schema: intentSchema,
-        name: "kern_intent",
-      }),
-    );
-    // Amounts and account IDs must come from the user's own words, never from KERN's
-    // replies or the model. Earlier user turns count, so a follow-up can complete them.
-    const said = [text, ...history.map((t) => t.user)];
-    for (const id of [parsed.entities.accountId, parsed.entities.toAccountId]) {
-      if (
-        id &&
-        (!z.uuid().safeParse(id).success ||
-          !said.some((s) => s.toLowerCase().includes(id.toLowerCase())))
-      )
-        return intent("clarify", {
-          answer:
-            "Aku belum bisa memastikan rekeningnya. Sebutkan ID rekening dari dashboard, ya. Untuk pengeluaran biasa, nama bank cukup ditulis sebagai cara pembayaran, misalnya “pakai QRIS BCA”.",
-        });
+  const chain = aiProviders();
+  if (!chain.length) return fallback(text, now, zone);
+  let limited = false;
+  for (const provider of chain) {
+    let parsed: Intent;
+    try {
+      parsed = intentSchema.parse(
+        await structured({
+          provider,
+          model: modelFor(provider),
+          system: instructions(now, zone),
+          text: withHistory(text.slice(0, 6000), history),
+          schema: intentSchema,
+          name: "kern_intent",
+        }),
+      );
+    } catch (error) {
+      limited ||= (error as { status?: unknown })?.status === 429;
+      continue;
     }
-    const amount = parsed.entities.amount;
-    // The message stating the amount must not name a foreign currency.
-    const stated = amount
-      ? said.filter((s) => amountsIn(s).includes(amount))
-      : [];
+    return checked(parsed, text, history);
+  }
+  const result = fallback(text, now, zone);
+  // Free tiers allow few requests per minute; say so instead of "not understood".
+  if (limited && result.intent === "clarify")
+    return intent("clarify", {
+      answer:
+        "Aku lagi kebanyakan permintaan ke layanan AI (batas gratis per menit). Coba kirim lagi sekitar 1 menit, ya. Belum ada yang aku simpan.",
+    });
+  return result;
+}
+// Amounts and account IDs must come from the user's own words, never from KERN's
+// replies or the model. Earlier user turns count, so a follow-up can complete them.
+function checked(parsed: Intent, text: string, history: Turn[]): Intent {
+  const said = [text, ...history.map((t) => t.user)];
+  for (const id of [parsed.entities.accountId, parsed.entities.toAccountId]) {
     if (
-      amount &&
-      (!stated.length ||
-        stated.some((s) => /\b(usd|eur|dolar|dollar)\b/i.test(s)))
+      id &&
+      (!z.uuid().safeParse(id).success ||
+        !said.some((s) => s.toLowerCase().includes(id.toLowerCase())))
     )
       return intent("clarify", {
         answer:
-          "Nominalnya berapa, ya? Tulis dalam rupiah bulat, misalnya “35rb” atau “35000”.",
+          "Aku belum bisa memastikan rekeningnya. Sebutkan ID rekening dari dashboard, ya. Untuk pengeluaran biasa, nama bank cukup ditulis sebagai cara pembayaran, misalnya “pakai QRIS BCA”.",
       });
-    return parsed;
-  } catch {
-    return fallback(text, now, zone);
   }
+  const amount = parsed.entities.amount;
+  // The message stating the amount must not name a foreign currency.
+  const stated = amount
+    ? said.filter((s) => amountsIn(s).includes(amount))
+    : [];
+  if (
+    amount &&
+    (!stated.length ||
+      stated.some((s) => /\b(usd|eur|dolar|dollar)\b/i.test(s)))
+  )
+    return intent("clarify", {
+      answer:
+        "Nominalnya berapa, ya? Tulis dalam rupiah bulat, misalnya “35rb” atau “35000”.",
+    });
+  return parsed;
 }

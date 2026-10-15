@@ -2,20 +2,23 @@ import type { Database, Tx } from "@/lib/db";
 import { AppError, safeCode } from "@/lib/errors";
 import { ZodError } from "zod";
 import { interpret, type Intent, type Turn } from "./ai";
-import { executeIntent, confirmAction, answerProposal } from "./conversation";
+import {
+  executeIntent,
+  confirmAction,
+  answerProposal,
+  cancelProposal,
+} from "./conversation";
+import { latestPending } from "./pending";
+import { settleDebts, settledText } from "./debts";
+import { payBill } from "./bills";
 import { handleReceiptPhoto, receiptDeps, type ReceiptDeps } from "./receipts";
-import { enqueue, retryAt } from "./queue";
+import { enqueue, retryAt, type Outbound } from "./queue";
 
 export async function processInbox(
   database: Database,
   now = new Date(),
   zone = "Asia/Jakarta",
-  parser: (
-    text: string,
-    now: Date,
-    zone: string,
-    history: Turn[],
-  ) => Promise<Intent> = interpret,
+  parser: Parser = interpret,
   limit = 10,
   media: ReceiptDeps = receiptDeps,
 ) {
@@ -32,59 +35,26 @@ export async function processInbox(
         });
         // Serialize owner actions including confirmations without holding locks in the webhook.
         await tx.$queryRaw`SELECT 1 FROM pg_advisory_xact_lock(hashtext(${`owner:${msg.ownerId}`}))`;
+        const before = (await latestPending(tx, msg.ownerId, now))?.id;
         await tx.$executeRawUnsafe("SAVEPOINT action_start");
         let reply: string;
+        let buttons: Outbound["buttons"];
         try {
-          const confirmation = msg.text
-            .trim()
-            .match(/^konfirmasi ([0-9a-f-]{36})$/i);
-          reply =
-            msg.text === "[UNSUPPORTED_MEDIA]"
-              ? "Aku bisa membaca teks dan foto nota, tapi belum bisa memproses voice note, video, atau file lain. Kirim dalam bentuk teks atau foto, ya."
-              : msg.text === "[IMAGE_TOO_LARGE]"
-                ? "Fotonya terlalu besar buat aku baca (maks. 4 MB). Coba kirim sebagai foto biasa, bukan file, ya."
-                : msg.fileId
-                  ? await handleReceiptPhoto(
-                      tx,
-                      msg.ownerId,
-                      { id: msg.fileId, mime: msg.fileMime || "image/jpeg" },
-                      msg.text,
-                      now,
-                      zone,
-                      media,
-                    )
-                  : confirmation
-                    ? await confirmAction(
-                        tx,
-                        msg.ownerId,
-                        confirmation[1],
-                        msg.id,
-                        now,
-                        zone,
-                      )
-                    : ((await answerProposal(
-                        tx,
-                        msg.ownerId,
-                        msg.text,
-                        msg.id,
-                        now,
-                        zone,
-                      )) ??
-                      (await executeIntent(
-                        tx,
-                        msg.ownerId,
-                        await parser(
-                          msg.text,
-                          now,
-                          zone,
-                          await recentTurns(tx, msg),
-                        ),
-                        msg.id,
-                        now,
-                        zone,
-                        false,
-                        media,
-                      )));
+          reply = await route(tx, msg, now, zone, parser, media);
+          // A new question gets one-tap answers; typing "ya"/"batal" still works.
+          const proposal = await latestPending(tx, msg.ownerId, now);
+          const payload = proposal?.payload as Record<string, unknown> | null;
+          if (
+            proposal &&
+            proposal.id !== before &&
+            (payload?.intent || payload?.debts)
+          )
+            buttons = [
+              [
+                { text: "✅ Ya, simpan", data: `ok:${proposal.id}` },
+                { text: "❌ Batal", data: `no:${proposal.id}` },
+              ],
+            ];
         } catch (error) {
           await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT action_start");
           if (error instanceof AppError || error instanceof ZodError)
@@ -112,6 +82,7 @@ export async function processInbox(
           {
             text: reply,
             chatId: msg.sender,
+            ...(buttons ? { buttons } : {}),
           },
           now,
         );
@@ -176,4 +147,71 @@ async function recentTurns(
       reply: typeof reply === "string" && reply !== "[REDACTED]" ? reply : null,
     };
   });
+}
+
+type Parser = (
+  text: string,
+  now: Date,
+  zone: string,
+  history: Turn[],
+) => Promise<Intent>;
+// Deterministic commands (typed or from buttons) run before any AI call.
+async function route(
+  tx: Tx,
+  msg: {
+    id: string;
+    ownerId: string;
+    text: string;
+    fileId: string | null;
+    fileMime: string | null;
+    receivedAt: Date;
+  },
+  now: Date,
+  zone: string,
+  parser: Parser,
+  media: ReceiptDeps,
+): Promise<string> {
+  if (msg.text === "[UNSUPPORTED_MEDIA]")
+    return "Aku bisa membaca teks dan foto nota, tapi belum bisa memproses voice note, video, atau file lain. Kirim dalam bentuk teks atau foto, ya.";
+  if (msg.text === "[IMAGE_TOO_LARGE]")
+    return "Fotonya terlalu besar buat aku baca (maks. 4 MB). Coba kirim sebagai foto biasa, bukan file, ya.";
+  if (msg.fileId)
+    return handleReceiptPhoto(
+      tx,
+      msg.ownerId,
+      { id: msg.fileId, mime: msg.fileMime || "image/jpeg" },
+      msg.text,
+      now,
+      zone,
+      media,
+    );
+  const command = msg.text
+    .trim()
+    .match(/^(konfirmasi|batal|lunas|bayar tagihan) ([0-9a-f-]{36})$/i);
+  if (command) {
+    const id = command[2];
+    switch (command[1].toLowerCase()) {
+      case "konfirmasi":
+        return confirmAction(tx, msg.ownerId, id, msg.id, now, zone);
+      case "batal":
+        return cancelProposal(tx, msg.ownerId, id, now);
+      case "lunas":
+        return settledText(await settleDebts(tx, msg.ownerId, { id }, now));
+      default:
+        return payBill(tx, msg.ownerId, { id }, msg.id, now, zone);
+    }
+  }
+  return (
+    (await answerProposal(tx, msg.ownerId, msg.text, msg.id, now, zone)) ??
+    executeIntent(
+      tx,
+      msg.ownerId,
+      await parser(msg.text, now, zone, await recentTurns(tx, msg)),
+      msg.id,
+      now,
+      zone,
+      false,
+      media,
+    )
+  );
 }

@@ -474,3 +474,28 @@ it("retries the last vision provider once after a short rate limit", async () =>
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
+it("tries the next text provider on a rate limit and says so when all are limited", async () => {
+  only("groq");
+  vi.stubEnv("GEMINI_API_KEY", "test-only");
+  vi.stubEnv("GEMINI_MODEL", "gemini-test");
+  vi.stubEnv("AI_PROVIDER", "groq,gemini");
+  const limited = Object.assign(new Error("429"), { status: 429 });
+  groqCreate.mockRejectedValueOnce(limited);
+  generate.mockResolvedValueOnce(
+    gemini("STOP", intent("list_debts", { direction: "owed_to_me" })),
+  );
+  expect((await interpret("siapa yang masih utang ke aku?")).intent).toBe(
+    "list_debts",
+  );
+  groqCreate.mockRejectedValueOnce(limited);
+  generate.mockRejectedValueOnce(limited);
+  const answer = await interpret("Sari aku talangin makan 45rb");
+  expect(answer.intent).toBe("clarify");
+  expect(answer.entities.answer).toContain("batas gratis per menit");
+  // A clear pattern still works through the deterministic fallback.
+  groqCreate.mockRejectedValueOnce(limited);
+  generate.mockRejectedValueOnce(limited);
+  expect((await interpret("Pengeluaran 35000 makan siang")).intent).toBe(
+    "create_transaction",
+  );
+});

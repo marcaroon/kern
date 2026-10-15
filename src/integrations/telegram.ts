@@ -32,7 +32,44 @@ const updateSchema = z.object({
         .optional(),
     })
     .optional(),
+  callback_query: z
+    .object({
+      id: z.string().min(1).max(100),
+      from: z.object({ id: z.number().int(), is_bot: z.boolean() }),
+      data: z.string().max(64).optional(),
+      message: z
+        .object({
+          message_id: z.number().int(),
+          chat: z.object({ id: z.number().int(), type: z.string() }),
+        })
+        .optional(),
+    })
+    .optional(),
 });
+// Button taps become the same deterministic commands a user could type.
+const buttonCommands: Record<string, string> = {
+  ok: "konfirmasi",
+  no: "batal",
+  paid: "bayar tagihan",
+  settle: "lunas",
+};
+export function buttonCommand(data: string | undefined) {
+  const match = data?.match(/^(ok|no|paid|settle):([0-9a-f-]{36})$/);
+  return match ? `${buttonCommands[match[1]]} ${match[2]}` : null;
+}
+type Callback = NonNullable<z.infer<typeof updateSchema>["callback_query"]>;
+function ownerCallback(item: unknown, allowed: string[]) {
+  const callback = updateSchema.safeParse(item).data?.callback_query;
+  if (
+    !callback?.message ||
+    callback.message.chat.type !== "private" ||
+    callback.from.is_bot ||
+    callback.from.id !== callback.message.chat.id ||
+    !allowed.includes(String(callback.from.id))
+  )
+    return null;
+  return callback as Callback & { message: NonNullable<Callback["message"]> };
+}
 const envelope = z.object({
   ok: z.boolean(),
   result: z.unknown().optional(),
@@ -111,6 +148,24 @@ export async function ingestUpdates(
 ) {
   let accepted = 0;
   for (const item of raw) {
+    const callback = ownerCallback(item, allowed);
+    const command = buttonCommand(callback?.data);
+    if (callback && command) {
+      // The callback ID is unique, so a redelivered tap is stored once.
+      const result = await database.inboxMessage.createMany({
+        data: {
+          id: `tgcb:${callback.id}`,
+          ownerId,
+          sender: String(callback.message.chat.id),
+          receivedAt: now,
+          availableAt: now,
+          text: command,
+        },
+        skipDuplicates: true,
+      });
+      accepted += result.count;
+      continue;
+    }
     const parsed = updateSchema.safeParse(item);
     if (!parsed.success || !parsed.data.message) continue;
     const message = parsed.data.message;
@@ -149,6 +204,43 @@ export async function ingestUpdates(
     accepted += result.count;
   }
   return { accepted };
+}
+// Stops the button's loading spinner and removes the keyboard so it cannot be tapped
+// twice. Best effort: the tap is already stored, and failures change nothing.
+export async function acknowledgeCallbacks(
+  raw: unknown[],
+  allowed: string[],
+  transport: typeof fetch = fetch,
+) {
+  if (!configured("TELEGRAM_BOT_TOKEN")) return 0;
+  let acknowledged = 0;
+  for (const item of raw) {
+    const callback = ownerCallback(item, allowed);
+    if (!callback) continue;
+    const known = buttonCommand(callback.data) !== null;
+    await call(
+      "answerCallbackQuery",
+      {
+        callback_query_id: callback.id,
+        text: known ? "Siap, aku proses…" : "Tombol ini sudah tidak berlaku.",
+      },
+      transport,
+      5000,
+    ).catch(() => undefined);
+    if (known)
+      await call(
+        "editMessageReplyMarkup",
+        {
+          chat_id: callback.message.chat.id,
+          message_id: callback.message.message_id,
+          reply_markup: { inline_keyboard: [] },
+        },
+        transport,
+        5000,
+      ).catch(() => undefined);
+    acknowledged++;
+  }
+  return acknowledged;
 }
 async function call(
   method: string,
@@ -271,7 +363,7 @@ export async function pollUpdates(
   const updates = await read({
     limit: 100,
     timeout: 0,
-    allowed_updates: ["message"],
+    allowed_updates: ["message", "callback_query"],
   });
   if (!updates.length) return { received: 0, accepted: 0 };
   const { accepted } = await ingestUpdates(
@@ -282,6 +374,7 @@ export async function pollUpdates(
     now,
   );
   await setupReplies(updates, allowedTelegramIds(), transport);
+  await acknowledgeCallbacks(updates, allowedTelegramIds(), transport);
   // Confirm only after the inbox commit; a crash before this point redelivers safely.
   const last = Math.max(
     ...updates.map(
@@ -307,6 +400,15 @@ export function telegramSender(transport: typeof fetch = fetch) {
           chat_id: chatId,
           text: payload.text.slice(0, 4096),
           link_preview_options: { is_disabled: true },
+          ...(payload.buttons?.length
+            ? {
+                reply_markup: {
+                  inline_keyboard: payload.buttons.map((row) =>
+                    row.map((b) => ({ text: b.text, callback_data: b.data })),
+                  ),
+                },
+              }
+            : {}),
         },
         transport,
         15000,

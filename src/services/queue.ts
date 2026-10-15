@@ -8,6 +8,17 @@ export const outboundPayload = z.object({
   reminderId: z.string().optional(),
   generation: z.number().optional(),
   occurrenceAt: z.string().optional(),
+  // Telegram inline keyboard rows; data is a short action such as "ok:<uuid>".
+  buttons: z
+    .array(
+      z.array(
+        z.object({
+          text: z.string().max(40),
+          data: z.string().regex(/^[a-z]+:[0-9a-f-]{36}$/),
+        }),
+      ),
+    )
+    .optional(),
 });
 export type Outbound = z.infer<typeof outboundPayload>;
 export async function enqueue(

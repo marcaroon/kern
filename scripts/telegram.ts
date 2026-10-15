@@ -59,7 +59,7 @@ if (command === "id") {
   await call("setWebhook", {
     url: `${base.replace(/\/$/, "")}/api/webhooks/telegram`,
     secret_token: secret,
-    allowed_updates: ["message"],
+    allowed_updates: ["message", "callback_query"],
     max_connections: 10,
   });
   console.log("Webhook registered. Use TELEGRAM_MODE=webhook on the server.");

@@ -1,5 +1,7 @@
 import { it, expect, vi, afterEach, beforeEach } from "vitest";
 import {
+  acknowledgeCallbacks,
+  buttonCommand,
   downloadTelegramImage,
   messageImage,
   setupReplies,
@@ -223,4 +225,58 @@ it("retries a stalled image download once with a friendly error", async () => {
   ).catch((e) => e);
   expect(down).toHaveBeenCalledTimes(2);
   expect(error.message).toContain("mengambil fotonya");
+});
+it("sends inline buttons and maps only known button data to commands", async () => {
+  const transport = reply(200, { ok: true, result: { message_id: 5 } });
+  const id = "11111111-1111-4111-8111-111111111111";
+  await telegramSender(transport as unknown as typeof fetch)({
+    text: "Simpan?",
+    buttons: [[{ text: "✅ Ya", data: `ok:${id}` }]],
+  });
+  const body = JSON.parse(
+    String(((transport.mock.calls[0] as unknown[])[1] as RequestInit).body),
+  );
+  expect(body.reply_markup).toEqual({
+    inline_keyboard: [[{ text: "✅ Ya", callback_data: `ok:${id}` }]],
+  });
+  expect(buttonCommand(`paid:${id}`)).toBe(`bayar tagihan ${id}`);
+  expect(buttonCommand(`settle:${id}`)).toBe(`lunas ${id}`);
+  expect(buttonCommand("ok:not-a-uuid")).toBeNull();
+  expect(buttonCommand(`sql:${id}`)).toBeNull();
+});
+it("answers owner button taps, removes the keyboard and ignores others", async () => {
+  const calls: { url: string; body: Record<string, unknown> }[] = [];
+  const transport = vi.fn(async (url: string, init?: RequestInit) => {
+    calls.push({ url, body: JSON.parse(String(init?.body)) });
+    return new Response(JSON.stringify({ ok: true, result: true }));
+  });
+  const tap = (from: number, data: string) => ({
+    update_id: 1,
+    callback_query: {
+      id: `cb-${from}`,
+      from: { id: from, is_bot: false },
+      data,
+      message: { message_id: 9, chat: { id: from, type: "private" } },
+    },
+  });
+  const id = "11111111-1111-4111-8111-111111111111";
+  expect(
+    await acknowledgeCallbacks(
+      [tap(1001, `ok:${id}`), tap(3003, `ok:${id}`), tap(1001, "old")],
+      ["1001"],
+      transport as unknown as typeof fetch,
+    ),
+  ).toBe(2);
+  expect(calls.map((c) => c.url.split("/").at(-1))).toEqual([
+    "answerCallbackQuery",
+    "editMessageReplyMarkup",
+    "answerCallbackQuery",
+  ]);
+  expect(calls[1].body).toMatchObject({
+    chat_id: 1001,
+    message_id: 9,
+    reply_markup: { inline_keyboard: [] },
+  });
+  expect(calls[2].body.text).toContain("sudah tidak berlaku");
+  expect(JSON.stringify(calls)).not.toContain("3003");
 });

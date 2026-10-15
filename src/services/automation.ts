@@ -10,6 +10,8 @@ import {
 } from "@/integrations/telegram";
 import { syncSheets } from "./sheets";
 import { report } from "./reporting";
+import { billReminders } from "./bills";
+import { debtNudges } from "./debts";
 import { DateTime } from "luxon";
 import { AppError, safeCode } from "@/lib/errors";
 export async function automate(
@@ -31,6 +33,8 @@ export async function automate(
         telegram,
         inbox: await processInbox(database, now, zone),
         reminders: await materializeReminders(database, now),
+        bills: await billReminders(database, now, zone),
+        debts: await debtNudges(database, now, zone),
         messages: await dispatchMessages(database, telegramSender(), now),
       };
     }

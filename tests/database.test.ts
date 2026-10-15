@@ -22,7 +22,10 @@ import {
 import { saveTask, saveReminder } from "@/services/records";
 import { ingestUpdates, pollUpdates } from "@/integrations/telegram";
 import { processInbox } from "@/services/inbox";
-import { fallback, intent, type Turn } from "@/services/ai";
+import { fallback, intent, type Intent, type Turn } from "@/services/ai";
+import { debtNudges } from "@/services/debts";
+import { billReminders } from "@/services/bills";
+import { report } from "@/services/reporting";
 import { planSplit, type ReceiptDeps } from "@/services/receipts";
 import { AppError } from "@/lib/errors";
 import { executeIntent, confirmAction } from "@/services/conversation";
@@ -67,7 +70,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await db.$executeRawUnsafe(
-    'TRUNCATE "AuditLog", "BudgetAlert", "Budget", "SheetSyncOutbox", "Transaction", "Account", "Reminder", "Task", "Note", "PendingAction", "Job", "InboxMessage", "Heartbeat" RESTART IDENTITY CASCADE',
+    'TRUNCATE "AuditLog", "Debt", "Bill", "BudgetAlert", "Budget", "SheetSyncOutbox", "Transaction", "Account", "Reminder", "Task", "Note", "PendingAction", "Job", "InboxMessage", "Heartbeat" RESTART IDENTITY CASCADE',
   );
 });
 const transaction = (amount = "35000") => ({
@@ -886,6 +889,7 @@ describe("receipt photos, split bill and conversation", () => {
         { item: 1, people: ["aku"] },
         { item: 2, people: ["Budi"] },
       ],
+      payer: null,
       question: null,
     }));
     await ingest(photo(70, "split bill: aku nasi goreng, Budi mie ayam"));
@@ -987,5 +991,335 @@ describe("receipt photos, split bill and conversation", () => {
         .status,
     ).toBe("active");
     expect(await db.transaction.count()).toBe(2);
+  });
+});
+describe("buttons, debts, bills and insights", () => {
+  const zone = "Asia/Jakarta";
+  const tap = (data: string, from = ownerChat, id = `cb${updateId}`) => ({
+    update_id: updateId++,
+    callback_query: {
+      id,
+      from: { id: from, is_bot: false },
+      data,
+      message: { message_id: 500, chat: { id: from, type: "private" } },
+    },
+  });
+  const photo = (messageId: number, caption?: string) => ({
+    update_id: updateId++,
+    message: {
+      message_id: messageId,
+      date: now.getTime() / 1000,
+      chat: { id: ownerChat, type: "private" },
+      from: { id: ownerChat, is_bot: false },
+      photo: [{ file_id: "p", file_size: 1000, width: 800, height: 600 }],
+      ...(caption ? { caption } : {}),
+    },
+  });
+  const receipt = {
+    is_receipt: true,
+    type: "expense" as const,
+    merchant: "Warung Bu Sri",
+    date: null,
+    currency: "IDR",
+    items: [
+      { name: "Nasi goreng", quantity: 1, amount: "25000" },
+      { name: "Mie ayam", quantity: 1, amount: "20000" },
+      { name: "Es teh", quantity: 2, amount: "10000" },
+    ],
+    subtotal: "55000",
+    tax: "5500",
+    service: null,
+    discount: null,
+    total: "60500",
+    payment_method: "QRIS",
+    category: "food",
+    problem: null,
+  };
+  const media = (plan?: ReceiptDeps["plan"]): ReceiptDeps => ({
+    download: vi.fn(async () => Buffer.from("image")),
+    read: vi.fn(async () => receipt),
+    plan: plan ?? planSplit,
+  });
+  const run = (at = now, deps = media()) =>
+    processInbox(db, at, zone, parse, 10, deps);
+  const jobs = async () =>
+    (await db.job.findMany({ orderBy: { createdAt: "asc" } })).map(
+      (j) =>
+        j.payload as {
+          text: string;
+          buttons?: { text: string; data: string }[][];
+        },
+    );
+  const act = (input: Intent, at = now, confirmed = false) =>
+    db.$transaction((tx) =>
+      executeIntent(tx, owner, input, "m", at, zone, confirmed),
+    );
+  const wib = (iso: string) => new Date(`${iso}+07:00`);
+
+  it("offers one-tap buttons and confirms through a stored button tap", async () => {
+    await ingest(photo(90));
+    await run();
+    const [reply] = await jobs();
+    const pending = await db.pendingAction.findFirstOrThrow();
+    expect(reply.buttons).toEqual([
+      [
+        { text: "✅ Ya, simpan", data: `ok:${pending.id}` },
+        { text: "❌ Batal", data: `no:${pending.id}` },
+      ],
+    ]);
+    // A redelivered tap is stored once; strangers and unknown data are ignored.
+    const ok = tap(`ok:${pending.id}`, ownerChat, "same-callback");
+    expect((await ingest(ok, ok)).accepted).toBe(1);
+    expect(
+      (await ingest(tap(`ok:${pending.id}`, 2002), tap("drop:table"))).accepted,
+    ).toBe(0);
+    await run();
+    expect((await db.transaction.findFirstOrThrow()).amount).toBe(60500n);
+    expect((await jobs())[1].buttons).toBeUndefined();
+  });
+  it("cancels exactly the tapped proposal", async () => {
+    await ingest(photo(91));
+    await run();
+    const pending = await db.pendingAction.findFirstOrThrow();
+    await ingest(tap(`no:${pending.id}`));
+    await run();
+    expect(await db.transaction.count()).toBe(0);
+    expect((await jobs())[1].text).toContain("nggak jadi");
+    await ingest(tap(`ok:${pending.id}`));
+    await run();
+    expect(await db.transaction.count()).toBe(0);
+  });
+  it("records split-bill debts atomically with the user's share", async () => {
+    const plan = vi.fn(async () => ({
+      participants: ["aku", "Budi", "Sari"],
+      assignments: [
+        { item: 1, people: ["aku"] },
+        { item: 2, people: ["Budi"] },
+      ],
+      payer: null,
+      question: null,
+    }));
+    await ingest(photo(92, "split bill"));
+    await run(now, media(plan));
+    expect((await jobs())[0].text).toContain("piutang: Budi");
+    expect(await db.debt.count()).toBe(0);
+    await ingest(update(93, "ya"));
+    await run(now, media(plan));
+    const debts = await db.debt.findMany({ orderBy: { person: "asc" } });
+    expect(debts.map((d) => [d.person, d.direction, d.amount])).toEqual([
+      ["Budi", "owed_to_me", 25667n],
+      ["Sari", "owed_to_me", 3666n],
+    ]);
+    const mine = await db.transaction.findFirstOrThrow();
+    // The three shares still add up to the receipt total.
+    expect(mine.amount + 25667n + 3666n).toBe(60500n);
+    expect((await jobs())[1].text).toContain("Piutang dicatat");
+  });
+  it("records what the user owes when a friend paid", async () => {
+    const plan = vi.fn(async () => ({
+      participants: ["aku", "Budi"],
+      assignments: [],
+      payer: "Budi",
+      question: null,
+    }));
+    await ingest(photo(94, "patungan, Budi yang bayar"));
+    await run(now, media(plan));
+    await ingest(update(95, "ya"));
+    await run(now, media(plan));
+    expect(await db.debt.findFirstOrThrow()).toMatchObject({
+      person: "Budi",
+      direction: "i_owe",
+      amount: 30250n,
+    });
+  });
+  it("tracks, settles and nudges debts once per step", async () => {
+    await act(
+      intent("create_debt", {
+        person: "Budi",
+        direction: "owed_to_me",
+        amount: "50000",
+        title: "tiket konser",
+      }),
+    );
+    await act(
+      intent("create_debt", {
+        person: "budi",
+        direction: "owed_to_me",
+        amount: "30000",
+        title: "bensin",
+      }),
+      new Date(now.getTime() + 60000),
+    );
+    expect(await act(intent("list_debts"))).toContain("Rp80.000");
+    // Nothing is due yet; after three days one nudge with a settle button.
+    await debtNudges(db, now, zone);
+    expect(await db.job.count()).toBe(0);
+    const later = new Date(now.getTime() + 3 * 86400000 + 120000);
+    await debtNudges(db, later, zone);
+    await debtNudges(db, later, zone);
+    const nudges = await jobs();
+    expect(nudges).toHaveLength(2);
+    expect(nudges.every((n) => n.text.includes("Hai Budi"))).toBe(true);
+    expect(nudges[0].buttons?.[0][0].data).toMatch(/^settle:/);
+    // A partial payment needs confirmation and is applied oldest first.
+    const reply = await act(
+      intent("settle_debt", { person: "BUDI", amount: "60000" }),
+    );
+    expect(reply).toContain("Kode konfirmasi");
+    const pending = await db.pendingAction.findFirstOrThrow();
+    const done = await db.$transaction((tx) =>
+      confirmAction(tx, owner, pending.id, "m2", now, zone),
+    );
+    expect(done).toContain("Sisa utangnya Rp20.000");
+    const rows = await db.debt.findMany({ orderBy: { createdAt: "asc" } });
+    expect(rows.map((r) => [r.status, r.paid])).toEqual([
+      ["settled", 50000n],
+      ["open", 10000n],
+    ]);
+    await expect(
+      act(
+        intent("settle_debt", { person: "Budi", amount: "99000" }),
+        now,
+        true,
+      ),
+    ).rejects.toThrow("Sisa utangnya cuma Rp20.000");
+    // The nudge button settles that debt directly.
+    await ingest(tap(`settle:${rows[1].id}`));
+    await run();
+    expect(
+      (await db.debt.findUniqueOrThrow({ where: { id: rows[1].id } })).status,
+    ).toBe("settled");
+    expect(await db.auditLog.count({ where: { action: "debt.settle" } })).toBe(
+      3,
+    );
+    // Settling is not income.
+    expect(await db.transaction.count()).toBe(0);
+  });
+  it("asks which way when both people owe each other", async () => {
+    for (const direction of ["owed_to_me", "i_owe"] as const)
+      await act(
+        intent("create_debt", {
+          person: "Sari",
+          direction,
+          amount: "10000",
+          title: "kopi",
+        }),
+      );
+    await expect(
+      act(intent("settle_debt", { person: "Sari" }), now, true),
+    ).rejects.toThrow("sama-sama punya utang");
+    expect(
+      await act(
+        intent("settle_debt", { person: "Sari", direction: "i_owe" }),
+        now,
+        true,
+      ),
+    ).toContain("Lunas");
+  });
+  it("reminds bills before, on and after the due day and records payment", async () => {
+    const saved = await act(
+      intent("create_bill", { title: "Internet", amount: "350000", day: 5 }),
+    );
+    expect(saved).toContain("tiap tanggal 5");
+    const bill = await db.bill.findFirstOrThrow();
+    expect(bill.nextDueAt).toEqual(wib("2026-11-05T09:00:00"));
+    // Before 09:00 local time nothing is sent; three days before, once.
+    await billReminders(db, wib("2026-11-02T08:00:00"), zone);
+    expect(await db.job.count()).toBe(0);
+    await billReminders(db, wib("2026-11-02T10:00:00"), zone);
+    await billReminders(db, wib("2026-11-02T11:00:00"), zone);
+    await billReminders(db, wib("2026-11-05T09:30:00"), zone);
+    const sent = await jobs();
+    expect(sent.map((j) => j.text.split(" ")[0])).toEqual(["🔔", "📅"]);
+    expect(sent[0].buttons?.[0][0].data).toBe(`paid:${bill.id}`);
+    // Tapping "Udah bayar" records the expense and moves to next month.
+    await ingest(tap(`paid:${bill.id}`));
+    await run(wib("2026-11-05T10:00:00"));
+    expect(await db.transaction.findFirstOrThrow()).toMatchObject({
+      amount: 350000n,
+      category: "bills",
+      description: "Tagihan Internet",
+    });
+    expect((await db.bill.findFirstOrThrow()).nextDueAt).toEqual(
+      wib("2026-12-05T09:00:00"),
+    );
+    // A second tap does not record twice.
+    await ingest(tap(`paid:${bill.id}`));
+    await run(wib("2026-11-05T10:05:00"));
+    expect(await db.transaction.count()).toBe(1);
+    expect((await jobs()).at(-1)?.text).toContain("sudah tercatat lunas");
+  });
+  it("asks the amount of variable bills and clamps day 31", async () => {
+    await act(intent("create_bill", { title: "Listrik", day: 31 }));
+    const bill = await db.bill.findFirstOrThrow();
+    expect(bill.nextDueAt).toEqual(wib("2026-10-31T09:00:00"));
+    expect(
+      await act(
+        intent("pay_bill", { title: "listrik" }),
+        wib("2026-10-31T10:00:00"),
+      ),
+    ).toContain("Berapa tagihan Listrik");
+    expect(await db.transaction.count()).toBe(0);
+    await act(
+      intent("pay_bill", { title: "listrik", amount: "450000" }),
+      wib("2026-10-31T10:00:00"),
+    );
+    expect((await db.bill.findFirstOrThrow()).nextDueAt).toEqual(
+      wib("2026-11-30T09:00:00"),
+    );
+    expect(await act(intent("list_bills"))).toContain("Listrik");
+    expect(await act(intent("cancel_bill", { title: "Listrik" }))).toContain(
+      "Kode konfirmasi",
+    );
+  });
+  it("explains budget pace, spending spikes, bills and debts from data", async () => {
+    await db.$transaction(async (tx) => {
+      await saveBudget(
+        tx,
+        owner,
+        { month: "2026-10", category: "food", amount: "1000000" },
+        now,
+      );
+      const spend = (amount: string, category: string, at: string) =>
+        saveTransaction(
+          tx,
+          owner,
+          {
+            ...transaction(amount),
+            category,
+            occurredAt: wib(at).toISOString(),
+          },
+          { now },
+        );
+      await spend("700000", "food", "2026-10-11T12:00:00");
+      for (const day of ["09-15", "09-22", "09-29", "10-03"])
+        await spend("50000", "entertainment", `2026-${day}T20:00:00`);
+      await spend("200000", "entertainment", "2026-10-10T20:00:00");
+    });
+    await act(
+      intent("create_bill", { title: "Internet", amount: "350000", day: 15 }),
+    );
+    await act(
+      intent("create_debt", {
+        person: "Budi",
+        direction: "owed_to_me",
+        amount: "27500",
+        title: "sate",
+      }),
+      new Date(now.getTime() - 8 * 86400000),
+    );
+    const text = await act(intent("finance_insight"));
+    expect(text).toContain("🟡 Anggaran Makan & Minum sudah terpakai 70%");
+    expect(text).toContain("Rp15.000 per hari");
+    expect(text).toContain(
+      "📈 Pengeluaran Hiburan 7 hari terakhir Rp200.000, 4,0×",
+    );
+    expect(text).toContain("Internet (15 Okt, Rp350.000)");
+    expect(text).toContain("Budi, 8 hari");
+    const morning = await db.$transaction((tx) =>
+      report(tx, owner, "daily", now, zone),
+    );
+    expect(morning).toContain("Insight keuangan:");
+    expect(morning).not.toContain("🟢");
   });
 });
