@@ -126,7 +126,8 @@ export async function processInbox(
         });
         return true;
       },
-      { timeout: 45000, maxWait: 5000 },
+      // Receipt photos need a download and a vision call; hosted functions allow 60 s.
+      { timeout: 55000, maxWait: 5000 },
     );
     if (!didWork) break;
     processed++;

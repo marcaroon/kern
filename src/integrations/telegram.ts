@@ -175,6 +175,27 @@ export async function downloadTelegramImage(
 ): Promise<Buffer> {
   if (!configured("TELEGRAM_BOT_TOKEN"))
     throw new AppError("TELEGRAM_NOT_CONFIGURED", 503);
+  const started = Date.now();
+  try {
+    return await downloadOnce(fileId, transport);
+  } catch (error) {
+    // Telegram's file servers occasionally stall; retry once if time allows.
+    if (
+      !(error instanceof AppError) ||
+      error.code !== "TELEGRAM_FILE_UNAVAILABLE" ||
+      Date.now() - started > 12000
+    )
+      throw error;
+    return downloadOnce(fileId, transport);
+  }
+}
+const fileUnavailable = () =>
+  new AppError(
+    "TELEGRAM_FILE_UNAVAILABLE",
+    503,
+    "Aku belum berhasil mengambil fotonya dari Telegram. Coba kirim ulang fotonya, ya. Belum ada yang aku simpan.",
+  );
+async function downloadOnce(fileId: string, transport: typeof fetch) {
   let path: string;
   try {
     const response = await call(
@@ -194,11 +215,15 @@ export async function downloadTelegramImage(
       .safeParse(await response.json().catch(() => null));
     if (!response.ok || !parsed.success) throw new Error("TELEGRAM_FILE");
     if ((parsed.data.result.file_size ?? 0) > maxImageBytes)
-      throw new AppError("IMAGE_TOO_LARGE", 413);
+      throw new AppError(
+        "IMAGE_TOO_LARGE",
+        413,
+        "Fotonya terlalu besar buat aku baca (maks. 4 MB). Coba kirim sebagai foto biasa, ya.",
+      );
     path = parsed.data.result.file_path;
   } catch (error) {
     if (error instanceof AppError) throw error;
-    throw new AppError("TELEGRAM_FILE_UNAVAILABLE", 503);
+    throw fileUnavailable();
   }
   let bytes: ArrayBuffer;
   try {
@@ -209,10 +234,14 @@ export async function downloadTelegramImage(
     if (!response.ok) throw new Error("TELEGRAM_FILE");
     bytes = await response.arrayBuffer();
   } catch {
-    throw new AppError("TELEGRAM_FILE_UNAVAILABLE", 503);
+    throw fileUnavailable();
   }
   if (bytes.byteLength > maxImageBytes)
-    throw new AppError("IMAGE_TOO_LARGE", 413);
+    throw new AppError(
+      "IMAGE_TOO_LARGE",
+      413,
+      "Fotonya terlalu besar buat aku baca (maks. 4 MB). Coba kirim sebagai foto biasa, ya.",
+    );
   return Buffer.from(bytes);
 }
 export async function pollUpdates(

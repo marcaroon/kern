@@ -10,7 +10,7 @@ import {
   intent,
   modelFor,
   structured,
-  visionTarget,
+  visionTargets,
   type Image,
   type Intent,
 } from "./ai";
@@ -35,7 +35,7 @@ export const receiptReading = z.object({
     z.object({
       name: z.string(),
       quantity: z.number().nullable(),
-      amount: z.string(),
+      amount: amountText,
     }),
   ),
   subtotal: amountText,
@@ -89,13 +89,15 @@ const splitWords =
   /\b(split|patungan|bagi|dibagi|bayarin|masing|per ?orang)\b/i;
 
 // Receipt amounts are rupiah integers; "45.000", "Rp 45,000" and "45.000,00" all mean 45000.
+// Models sometimes echo a whole line ("7,000 x 10 = 70,000" or "/ 70,000"); the last
+// number on it is the line total. Anything without a plausible number reads as 0.
 export function receiptAmount(value: string | null | undefined) {
-  if (!value) return 0n;
-  const cleaned = value
-    .trim()
+  const numbers = value?.match(/\d[\d.,]*/g);
+  if (!numbers) return 0n;
+  const cleaned = numbers[numbers.length - 1]
     .replace(/[.,]\d{1,2}$/, "")
     .replace(/\D/g, "");
-  return cleaned ? BigInt(cleaned) : 0n;
+  return cleaned && cleaned.length <= 15 ? BigInt(cleaned) : 0n;
 }
 // Splits an amount by weights in whole rupiah; the parts always sum exactly to amount.
 export function allocate(amount: bigint, weights: bigint[]): bigint[] {
@@ -162,7 +164,8 @@ export function normalizeReceipt(
       : type === "income"
         ? "other_income"
         : "other";
-  return receiptSchema.parse({
+  // Model output is untrusted: anything that still fails validation is "unreadable".
+  const result = receiptSchema.safeParse({
     merchant,
     type,
     occurredAt: receiptDate(reading.date, now, zone),
@@ -177,30 +180,51 @@ export function normalizeReceipt(
         .join(" ")
         .slice(0, 300) || null,
   });
+  return result.success ? result.data : null;
 }
 // The printed date is used when plausible; otherwise the moment the photo arrived.
+// Models return ISO, "2026-10-01 18:08:19" or the printed "01/10/2026 18:08".
+function parseReceiptDate(value: string, zone: string) {
+  const text = value.trim().replace(/^(\d{4}-\d{2}-\d{2})[ ,]+(?=\d)/, "$1T");
+  const iso = DateTime.fromISO(text, { zone });
+  if (iso.isValid) return { date: iso, timed: /T\d/.test(text) };
+  const local = text.match(
+    /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})(?:[ ,T]+(\d{1,2})[:.](\d{2}))?/,
+  );
+  if (!local) return null;
+  const date = DateTime.fromObject(
+    {
+      day: Number(local[1]),
+      month: Number(local[2]),
+      year: Number(local[3]),
+      hour: local[4] ? Number(local[4]) : 12,
+      minute: local[5] ? Number(local[5]) : 0,
+    },
+    { zone },
+  );
+  return date.isValid ? { date, timed: Boolean(local[4]) } : null;
+}
 function receiptDate(value: string | null, now: Date, zone: string) {
   const current = DateTime.fromJSDate(now).setZone(zone);
-  const parsed = value ? DateTime.fromISO(value.trim(), { zone }) : null;
+  const parsed = value ? parseReceiptDate(value, zone) : null;
   if (
-    !parsed?.isValid ||
-    parsed > current.plus({ hours: 1 }) ||
-    parsed < current.minus({ years: 1 })
+    !parsed ||
+    parsed.date > current.plus({ hours: 1 }) ||
+    parsed.date < current.minus({ years: 1 })
   )
     return now.toISOString();
-  if (parsed.hasSame(current, "day")) return now.toISOString();
+  if (parsed.date.hasSame(current, "day")) return now.toISOString();
   // A date without a time is placed at midday so it never shifts into another day.
-  const timed = /T\d/.test(value!) ? parsed : parsed.set({ hour: 12 });
-  return timed.toISO()!;
+  return (parsed.timed ? parsed.date : parsed.date.set({ hour: 12 })).toISO()!;
 }
 
 const readingPrompt = [
   "You read photos of receipts (nota, struk, invoice, bill, e-wallet or bank payment/transfer proof) for an Indonesian personal finance app and return JSON that follows the schema.",
   "is_receipt is false when the image is not a receipt, bill or payment proof, or is too unreadable to find a total.",
-  "Amounts are rupiah integers exactly as printed (e.g. 45000), never computed or guessed; null when absent or unreadable.",
-  "items: each purchased line with its line total after quantity. Do not list subtotal, tax, service, discount, rounding, payment or change rows as items.",
+  "Amounts: write only the digits of the rupiah value printed on the receipt, without Rp, dots, commas or words: 'Rp70.000' or '70,000' becomes \"70000\". Read every amount you can see; use null only when a value is absent or truly illegible. Never write sentences in amount fields and never guess.",
+  "items: each purchased line with its name, quantity and the line total printed for it (for '7,000 x 10 ... 70,000' the amount is 70000). Do not list subtotal, tax, service, discount, rounding, payment (Jumlah Bayar, Tunai) or change (Kembalian) rows as items.",
   "tax: PPN/PB1/pajak. service: service charge. discount: all discounts or promos as a positive number. total: the final amount paid (grand total), not the cash handed over or the change.",
-  "type is income only for proof of money received (incoming transfer, payslip); otherwise expense.",
+  "type: a shop, restaurant or merchant receipt is always expense. income only for proof of money received by the user (incoming transfer, payslip).",
   "date: the printed date as YYYY-MM-DDTHH:mm (local, no offset) or YYYY-MM-DD, or null. currency: ISO code, IDR for Rp.",
   `category for expense: ${expenseCategories.join("/")}; for income: ${incomeCategories.join("/")}.`,
   "payment_method: as printed, e.g. QRIS, Tunai, Debit BCA, GoPay, OVO; else null.",
@@ -211,32 +235,81 @@ export async function readReceipt(
   image: Image,
   caption: string,
 ): Promise<ReceiptReading> {
-  const target = visionTarget();
-  if (!target)
+  const targets = visionTargets();
+  if (!targets.length)
     throw new AppError(
       "VISION_NOT_CONFIGURED",
       503,
       "Aku belum bisa membaca foto nota karena model AI untuk gambar belum diatur. Atur GROQ_VISION_MODEL (atau AI_VISION_PROVIDER), lalu kirim ulang fotonya. Sementara itu, tulis saja transaksinya, misalnya “pengeluaran 35rb makan siang”.",
     );
-  try {
-    return receiptReading.parse(
-      await structured({
-        ...target,
-        system: readingPrompt,
-        text: `Caption pengguna: ${caption.slice(0, 1000) || "(kosong)"}`,
-        schema: receiptReading,
-        name: "kern_receipt",
-        image,
-        timeout: 25000,
-      }),
-    );
-  } catch {
-    throw new AppError(
-      "VISION_UNAVAILABLE",
-      503,
-      "Maaf, aku lagi gagal membaca notanya. Coba kirim ulang fotonya sebentar lagi, ya. Belum ada yang aku simpan.",
-    );
+  let lastError: unknown = null;
+  for (const [index, target] of targets.entries()) {
+    const call = async () =>
+      receiptReading.parse(
+        await structured({
+          ...target,
+          system: readingPrompt,
+          text: `Caption pengguna: ${caption.slice(0, 1000) || "(kosong)"}`,
+          schema: receiptReading,
+          name: "kern_receipt",
+          image,
+          timeout: 25000,
+        }),
+      );
+    try {
+      return await call();
+    } catch (error) {
+      lastError = error;
+      logVisionFailure(target.provider, error);
+      // Free tiers allow few tokens per minute. With no other provider left,
+      // one short wait often suffices.
+      const wait = index === targets.length - 1 ? retryDelay(error) : null;
+      if (wait === null) continue;
+      await new Promise((resolve) => setTimeout(resolve, wait));
+      try {
+        return await call();
+      } catch (retryError) {
+        lastError = retryError;
+        logVisionFailure(target.provider, retryError);
+      }
+    }
   }
+  throw visionFailure(lastError);
+}
+function statusOf(error: unknown) {
+  const status = (error as { status?: unknown })?.status;
+  return typeof status === "number" ? status : null;
+}
+// Milliseconds to wait before one retry of a rate-limited request, or null.
+export function retryDelay(error: unknown) {
+  if (statusOf(error) !== 429) return null;
+  const headers = (error as { headers?: { get?: (name: string) => unknown } })
+    .headers;
+  const header = Number(headers?.get?.("retry-after"));
+  const seconds = Number.isFinite(header) && header > 0 ? header : 3;
+  return seconds <= 5 ? Math.ceil(seconds * 1000) : null;
+}
+// Provider and status code only: never the provider message, which may echo content.
+function logVisionFailure(provider: string, error: unknown) {
+  const status = statusOf(error);
+  console.error(
+    JSON.stringify({
+      event: "vision_failed",
+      provider,
+      status,
+      code: status ? undefined : "UNUSABLE_OR_NETWORK",
+    }),
+  );
+}
+function visionFailure(error: unknown) {
+  const limited = statusOf(error) === 429;
+  return new AppError(
+    limited ? "VISION_RATE_LIMITED" : "VISION_UNAVAILABLE",
+    503,
+    limited
+      ? "Layanan AI pembaca nota lagi kena batas pemakaian per menit. Tunggu sekitar 1 menit, lalu kirim ulang fotonya, ya. Belum ada yang aku simpan."
+      : "Maaf, aku lagi gagal membaca notanya. Coba kirim ulang fotonya sebentar lagi, ya. Belum ada yang aku simpan.",
+  );
 }
 
 const planPrompt = [

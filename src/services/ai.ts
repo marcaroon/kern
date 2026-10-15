@@ -254,12 +254,27 @@ export function aiProvider(): AiProvider | null {
   return providers.find((p) => ready[p]) ?? null;
 }
 // Receipt photos may use another provider (AI_VISION_PROVIDER) and model (<P>_VISION_MODEL).
-export function visionTarget(): { provider: AiProvider; model: string } | null {
-  const chosen = chosenProvider("AI_VISION_PROVIDER");
-  const provider = chosen === undefined ? aiProvider() : chosen;
-  if (!provider) return null;
-  const model = visionModelFor(provider);
-  return model ? { provider, model } : null;
+// A comma-separated list ("groq,gemini") is tried in order, so a rate-limited free
+// tier can fall back to another configured provider.
+export function visionTargets(): { provider: AiProvider; model: string }[] {
+  const listed = (process.env.AI_VISION_PROVIDER || "")
+    .split(",")
+    .map((p) => p.trim().toLowerCase())
+    .filter(Boolean);
+  const ready = readyProviders();
+  const chosen = listed.length
+    ? listed.map((name) => providers.find((p) => p === name && ready[p]))
+    : [aiProvider()];
+  const targets: { provider: AiProvider; model: string }[] = [];
+  for (const provider of chosen) {
+    const model = provider && visionModelFor(provider);
+    if (provider && model && !targets.some((t) => t.provider === provider))
+      targets.push({ provider, model });
+  }
+  return targets;
+}
+export function visionTarget() {
+  return visionTargets()[0] ?? null;
 }
 function instructions(now: Date, zone: string) {
   return [

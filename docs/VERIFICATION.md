@@ -86,3 +86,13 @@ One owner, text messages and receipt photos, keyword memory and one action per m
 Migration `202610150001_receipt_media` adds nullable `InboxMessage.fileId` and `fileMime`. All 95 tests (credential-free, embedded PostgreSQL), lint, strict typecheck, Prettier, the production build and `npm run test:migrations` passed. Tests cover photo ingestion and size limits, token-free download errors, provider request shapes for Groq and Gemini images, receipt normalisation, exact split arithmetic, `ya`/`batal` confirmation, proposal superseding, owner-scoped conversation history and amounts taken only from the user's own words.
 
 **Not verified live:** no real receipt photo has been read by any provider. Groq vision (`GROQ_VISION_MODEL`, non-strict JSON Schema with images), OpenAI/Anthropic/Gemini image input, Telegram `getFile` downloads and the new persona's tone on real messages are covered by mocked tests only. Before relying on them, send a few real receipts (clear, blurry, with tax/service, a transfer proof) and a split caption to the production bot and compare the readings with the paper receipts.
+
+## Live receipt test and fixes (15 October 2026)
+
+The first two real receipt photos sent to production failed. Reproduced locally with the stored Telegram `file_id`s (read-only database access) and the production providers:
+
+- `qwen/qwen3.8-27b` on Groq returned inconsistent JSON under the first prompt: amounts as `"/ 70,000"`, sentences ("This amount is uncertain…") in amount fields, and the receipt typed as income. The old normaliser could then throw a validation error, shown as the generic "Belum bisa aku simpan" reply.
+- The second photo hit Groq's free-tier limit (HTTP 429, 1,000 output tokens per minute; tokens per minute 8,000), because both photos arrived within a minute.
+- Telegram `getFile` and file downloads from this machine took 0.6–10 s and once hit a 16 s connect timeout.
+
+After the fixes (stricter prompt, nullable amounts, last-number parsing, never-throwing normalisation, provider fallback list, one short 429 retry, download retry, tolerant date parsing), qwen read the first photo of the Sate Balibul receipt correctly four times and the second photo once (two other attempts on it within the same minute were rate limited), and `gemini-3.5-flash-lite` read each photo correctly once: five items summing to Rp154.000, total Rp154.000, category food, printed date 1 Oct 2026 18:08. One qwen run noted a cut-off bottom edge as a problem; one Gemini run also read the payment method "Tunai". This is two photos of one receipt; other layouts (tax/service lines, e-wallet proofs, long receipts) remain untested. All 100 tests, lint, typecheck, Prettier, build and migration checks passed.

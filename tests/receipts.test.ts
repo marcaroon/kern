@@ -42,6 +42,13 @@ describe("receipt amounts and allocation", () => {
     expect(receiptAmount("45,000.00")).toBe(45000n);
     expect(receiptAmount(null)).toBe(0n);
     expect(receiptAmount("-")).toBe(0n);
+    // Shapes returned by a live vision model on a real receipt (15 Oct 2026).
+    expect(receiptAmount("/ 70,000")).toBe(70000n);
+    expect(receiptAmount("7,000 x 10 = 70,000")).toBe(70000n);
+    expect(receiptAmount("This amount is uncertain or not specified.")).toBe(
+      0n,
+    );
+    expect(receiptAmount("12345678901234567890")).toBe(0n);
   });
   it("allocates exactly, including remainders, negatives and zero weights", () => {
     expect(allocate(100n, [1n, 1n, 1n])).toEqual([34n, 33n, 33n]);
@@ -98,6 +105,15 @@ describe("receipt normalisation", () => {
       zone,
     )!;
     expect(old.occurredAt).toBe("2026-10-10T12:00:00.000+07:00");
+    for (const printed of [
+      "2026-10-01 18:08:19",
+      "2026-10-01T18:08",
+      "01/10/2026 18:08",
+      "1-10-2026, 18.08",
+    ])
+      expect(
+        normalizeReceipt(reading({ date: printed }), "", now, zone)!.occurredAt,
+      ).toMatch(/^2026-10-01T18:08:\d{2}\.000\+07:00$/);
     expect(
       normalizeReceipt(reading({ date: "2027-01-01" }), "", now, zone)!
         .occurredAt,
@@ -191,5 +207,56 @@ describe("split bill", () => {
       "450000",
     );
     expect(fallback("bagi rata 4 orang").entities.amount).toBeNull();
+  });
+});
+describe("untrusted model output", () => {
+  it("treats sentence amounts as unreadable instead of failing validation", () => {
+    const junk = "This amount is uncertain or not specified. Try again.";
+    expect(
+      normalizeReceipt(
+        reading({
+          items: reading().items.map((i) => ({ ...i, amount: junk })),
+          subtotal: junk,
+          total: junk,
+          tax: null,
+        }),
+        "",
+        now,
+        zone,
+      ),
+    ).toBeNull();
+    const partly = normalizeReceipt(
+      reading({
+        items: [
+          { name: "Sate", quantity: 10, amount: "/ 70,000" },
+          { name: "Es", quantity: 1, amount: null },
+        ],
+        tax: null,
+        total: "/ 154,000",
+      }),
+      "",
+      now,
+      zone,
+    )!;
+    expect(partly.total).toBe("154000");
+    expect(partly.items).toEqual([{ name: "Sate", amount: "70000" }]);
+    expect(partly.warning).toContain("tidak pas");
+  });
+  it("never throws on oversized model strings", () => {
+    expect(() =>
+      normalizeReceipt(
+        reading({
+          merchant: "x".repeat(5000),
+          payment_method: "y".repeat(5000),
+          problem: "z".repeat(5000),
+          items: [{ name: "n".repeat(5000), quantity: null, amount: "5000" }],
+          tax: null,
+          total: "5000",
+        }),
+        "",
+        now,
+        zone,
+      ),
+    ).not.toThrow();
   });
 });

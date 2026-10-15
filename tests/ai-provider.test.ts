@@ -28,7 +28,13 @@ vi.mock("@google/genai", async (original) => ({
     models = { generateContent: generate };
   },
 }));
-import { aiProvider, interpret, intent, visionTarget } from "@/services/ai";
+import {
+  aiProvider,
+  interpret,
+  intent,
+  visionTarget,
+  visionTargets,
+} from "@/services/ai";
 import { readReceipt } from "@/services/receipts";
 function only(provider: "groq" | "openai" | "anthropic" | "gemini" | "") {
   for (const name of [
@@ -416,4 +422,55 @@ it("passes recent turns and accepts amounts the user stated earlier only", async
       ])
     ).intent,
   ).toBe("create_transaction");
+});
+it("falls back to the next vision provider when the first is rate limited", async () => {
+  only("groq");
+  vi.stubEnv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b");
+  vi.stubEnv("GEMINI_API_KEY", "test-only");
+  vi.stubEnv("GEMINI_MODEL", "gemini-test");
+  vi.stubEnv("AI_VISION_PROVIDER", "groq, gemini");
+  expect(visionTargets().map((t) => t.provider)).toEqual(["groq", "gemini"]);
+  const limited = Object.assign(new Error("429"), {
+    status: 429,
+    headers: new Headers({ "retry-after": "2" }),
+  });
+  groqCreate.mockRejectedValueOnce(limited);
+  generate.mockResolvedValueOnce(gemini("STOP", receiptBody));
+  const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+  expect((await readReceipt(image, "")).merchant).toBe("Kopi Kenangan");
+  expect(groqCreate).toHaveBeenCalledTimes(1);
+  expect(generate).toHaveBeenCalledTimes(1);
+  // Only provider and status are logged, never the provider's message.
+  expect(errors.mock.calls[0][0]).toBe(
+    JSON.stringify({ event: "vision_failed", provider: "groq", status: 429 }),
+  );
+  errors.mockRestore();
+});
+it("retries the last vision provider once after a short rate limit", async () => {
+  vi.useFakeTimers();
+  only("groq");
+  vi.stubEnv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b");
+  const limited = (seconds: string) =>
+    Object.assign(new Error("429"), {
+      status: 429,
+      headers: new Headers({ "retry-after": seconds }),
+    });
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  groqCreate.mockRejectedValueOnce(limited("2")).mockResolvedValueOnce({
+    choices: [
+      {
+        finish_reason: "stop",
+        message: { content: JSON.stringify(receiptBody) },
+      },
+    ],
+  });
+  const result = readReceipt(image, "");
+  await vi.advanceTimersByTimeAsync(2000);
+  expect((await result).total).toBe("22000");
+  // A long wait is not attempted inside the request; the user is told instead.
+  groqCreate.mockRejectedValueOnce(limited("40"));
+  await expect(readReceipt(image, "")).rejects.toThrow("batas pemakaian");
+  expect(groqCreate).toHaveBeenCalledTimes(3);
+  vi.useRealTimers();
+  vi.restoreAllMocks();
 });

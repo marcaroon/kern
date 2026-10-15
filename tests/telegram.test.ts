@@ -198,3 +198,29 @@ it("accepts image documents and refuses other files", () => {
     }),
   ).toBe("too_large");
 });
+it("retries a stalled image download once with a friendly error", async () => {
+  let calls = 0;
+  const flaky = vi.fn(async (url: string) => {
+    calls++;
+    if (calls === 1) throw new TypeError("fetch failed");
+    return url.endsWith("/getFile")
+      ? new Response(
+          JSON.stringify({ ok: true, result: { file_path: "photos/a.jpg" } }),
+        )
+      : new Response("ok");
+  });
+  expect(
+    (
+      await downloadTelegramImage("abc", flaky as unknown as typeof fetch)
+    ).toString(),
+  ).toBe("ok");
+  const down = vi.fn(async () => {
+    throw new TypeError("fetch failed");
+  });
+  const error = await downloadTelegramImage(
+    "abc",
+    down as unknown as typeof fetch,
+  ).catch((e) => e);
+  expect(down).toHaveBeenCalledTimes(2);
+  expect(error.message).toContain("mengambil fotonya");
+});
