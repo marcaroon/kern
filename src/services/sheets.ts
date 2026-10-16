@@ -11,6 +11,7 @@ export async function syncSheets(
   database: Database,
   now = new Date(),
   sheet?: SheetPort,
+  limit = 20,
 ) {
   if (
     !sheet &&
@@ -19,7 +20,7 @@ export async function syncSheets(
     return { status: "not_configured", processed: 0 };
   const port = sheet || googleSheet();
   let processed = 0;
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < limit; i++) {
     const worked = await database.$transaction(
       async (tx) => {
         // One writer per managed worksheet, including revisions of the same transaction.

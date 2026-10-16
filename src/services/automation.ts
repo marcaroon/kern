@@ -16,6 +16,41 @@ import { habitCheckins } from "./habits";
 import { embedPendingNotes } from "./semantic";
 import { DateTime } from "luxon";
 import { AppError, safeCode } from "@/lib/errors";
+// The external cron calls tick every minute; ten silent minutes means it stopped.
+const staleAfter = 10 * 60 * 1000;
+export async function schedulerAlert(
+  database: Database,
+  now: Date,
+  zone: string,
+) {
+  const tick = await database.heartbeat.findUnique({ where: { name: "tick" } });
+  if (tick && now.getTime() - tick.at.getTime() < staleAfter)
+    return { alerted: false };
+  const owner = ownerId();
+  const day = DateTime.fromJSDate(now).setZone(zone).toISODate();
+  const since = tick
+    ? DateTime.fromJSDate(tick.at)
+        .setZone(zone)
+        .setLocale("id")
+        .toFormat("d LLL HH:mm")
+    : null;
+  const job = await database.$transaction((tx) =>
+    enqueue(
+      tx,
+      owner,
+      `alert:scheduler:${day}`,
+      {
+        text: [
+          `⚠️ Scheduler KERN ${since ? `tidak jalan sejak ${since}` : "belum pernah jalan"}.`,
+          "Pengingat, laporan harian, tagihan, check-in kebiasaan dan sinkronisasi Sheets jadi tertunda (Sheets tetap aku coba sinkronkan tiap kamu kirim pesan).",
+          "Cek job di cron-job.org: POST /api/internal/tick setiap menit dengan header Authorization Bearer, dan pastikan job-nya tidak nonaktif.",
+        ].join("\n"),
+      },
+      now,
+    ),
+  );
+  return { alerted: job.status === "pending" && job.attempts === 0 };
+}
 export async function automate(
   database: Database,
   operation: string,
@@ -42,12 +77,32 @@ export async function automate(
         messages: await dispatchMessages(database, telegramSender(), now),
       };
     }
-    case "reply":
+    case "reply": {
       // Bound webhook work to one message; the scheduler drains any backlog.
+      const inbox = await processInbox(database, now, zone, undefined, 1);
+      // The reply goes out before the slower spreadsheet work.
+      const messages = await dispatchMessages(
+        database,
+        telegramSender(),
+        now,
+        1,
+      );
+      // New transactions reach Sheets even if the external scheduler stops; a
+      // stopped scheduler is reported to the owner at most once a day.
+      const sheets = await syncSheets(database, now, undefined, 2).catch(
+        (error) => ({ error: safeCode(error) }),
+      );
+      const scheduler = await schedulerAlert(database, now, zone);
       return {
-        inbox: await processInbox(database, now, zone, undefined, 1),
-        messages: await dispatchMessages(database, telegramSender(), now, 1),
+        inbox,
+        messages,
+        sheets,
+        scheduler,
+        alert: scheduler.alerted
+          ? await dispatchMessages(database, telegramSender(), now, 1)
+          : undefined,
       };
+    }
     case "tick": {
       // One external per-minute scheduler call drives everything on serverless hosts.
       // Reports run in a window so a late or skipped minute still fires once; their

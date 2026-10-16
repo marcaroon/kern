@@ -40,7 +40,7 @@ vi.mock("@/lib/auth", () => ({
 }));
 import { handleApi } from "@/controllers/api";
 import { receiveTelegram } from "@/controllers/webhook";
-import { automate } from "@/services/automation";
+import { automate, schedulerAlert } from "@/services/automation";
 import { integrationHealth } from "@/services/health";
 
 const owner = "11111111-1111-4111-8111-111111111111";
@@ -585,6 +585,25 @@ describe("Google Sheets outbox under partial failure", () => {
       await db.sheetSyncOutbox.count({ where: { status: "synced" } }),
     ).toBe(2);
   });
+  it("syncs at most the requested number of events per run", async () => {
+    for (const amount of ["1000", "2000", "3000"])
+      await db.$transaction((tx) =>
+        saveTransaction(tx, owner, transaction(amount), { now }),
+      );
+    const rows = new Map<string, string[][]>();
+    rows.set("Transactions!A1:L1", [sheetHeaders]);
+    const port: SheetPort = {
+      read: async (range) => rows.get(range) ?? [],
+      write: async (range, values) => {
+        rows.set(range, values);
+      },
+    };
+    expect((await syncSheets(db, now, port, 2)).processed).toBe(2);
+    expect(
+      await db.sheetSyncOutbox.count({ where: { status: "synced" } }),
+    ).toBe(2);
+    expect((await syncSheets(db, now, port, 2)).processed).toBe(1);
+  });
   it("retains pending events when the optional integration is absent", async () => {
     await db.$transaction((tx) =>
       saveTransaction(tx, owner, transaction(), { now }),
@@ -630,6 +649,8 @@ describe("serverless webhook and scheduler", () => {
   }
   it("stores, executes and answers a webhook message in the same request", async () => {
     hosted();
+    // A running scheduler, so no stopped-scheduler alert is sent.
+    await db.heartbeat.create({ data: { name: "tick", at: new Date() } });
     const sent = vi.fn(
       async () =>
         new Response(JSON.stringify({ ok: true, result: { message_id: 9 } })),
@@ -736,6 +757,53 @@ describe("serverless webhook and scheduler", () => {
     expect(keys.some((k) => k.includes(":weekly:"))).toBe(true);
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
+  });
+  it("warns the owner once a day when the scheduler stops, via webhook traffic", async () => {
+    hosted();
+    const sent: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sent.push(JSON.parse(String(init?.body)).text);
+        return new Response(
+          JSON.stringify({ ok: true, result: { message_id: sent.length } }),
+        );
+      }),
+    );
+    try {
+      const at = new Date();
+      await db.heartbeat.create({
+        data: { name: "tick", at: new Date(at.getTime() - 3 * 86400000) },
+      });
+      await ingest(update(60));
+      const result = (await automate(db, "reply", at)) as {
+        sheets: { status: string };
+      };
+      expect(result.sheets.status).toBe("not_configured");
+      expect(sent).toHaveLength(2);
+      expect(sent[0]).toContain("Rp35.000");
+      expect(sent[1]).toContain("Scheduler KERN tidak jalan sejak");
+      await ingest(update(61));
+      await automate(db, "reply", new Date(at.getTime() + 60000));
+      expect(sent.filter((t) => t.includes("Scheduler KERN"))).toHaveLength(1);
+      // Once the scheduler runs again, nothing is reported.
+      await db.heartbeat.update({
+        where: { name: "tick" },
+        data: { at: new Date(at.getTime() + 120000) },
+      });
+      expect(
+        (
+          await schedulerAlert(
+            db,
+            new Date(at.getTime() + 180000),
+            "Asia/Jakarta",
+          )
+        ).alerted,
+      ).toBe(false);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
   });
   it("reports whether the external scheduler ran recently", async () => {
     const health = () => integrationHealth(db, owner);
