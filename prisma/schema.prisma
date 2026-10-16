@@ -111,16 +111,19 @@ model Reminder {
 }
 
 model Note {
-  id        String   @id @default(uuid())
-  ownerId   String
-  title     String
-  content   String
-  tags      String[] @default([])
-  category  String   @default("general")
-  project   String?
-  archived  Boolean  @default(false)
-  createdAt DateTime @default(now()) @db.Timestamptz(3)
-  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  id             String   @id @default(uuid())
+  ownerId        String
+  title          String
+  content        String
+  tags           String[] @default([])
+  category       String   @default("general")
+  project        String?
+  archived       Boolean  @default(false)
+  // Meaning-based search: vector and the model that produced it (null = pending).
+  embedding      Float[]  @default([])
+  embeddingModel String?
+  createdAt      DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(3)
 
   @@index([ownerId, archived, createdAt])
 }
@@ -246,4 +249,48 @@ model Bill {
 
   @@index([ownerId, status])
   @@index([status, nextDueAt])
+}
+
+// Savings goal; contributions are set aside, not income or expense.
+model Goal {
+  id         String    @id @default(uuid())
+  ownerId    String
+  name       String
+  target     BigInt
+  saved      BigInt    @default(0)
+  deadline   DateTime? @db.Timestamptz(3)
+  status     String    @default("active")
+  achievedAt DateTime? @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@index([ownerId, status])
+}
+
+// Daily habit with a local check-in time (HH:mm).
+model Habit {
+  id          String     @id @default(uuid())
+  ownerId     String
+  name        String
+  checkinTime String     @default("20:00")
+  status      String     @default("active")
+  logs        HabitLog[]
+  createdAt   DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime   @updatedAt @db.Timestamptz(3)
+
+  @@index([ownerId, status])
+}
+
+// One entry per habit and local day (yyyy-MM-dd).
+model HabitLog {
+  id        String   @id @default(uuid())
+  ownerId   String
+  habitId   String
+  habit     Habit    @relation(fields: [habitId], references: [id])
+  day       String
+  done      Boolean
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@unique([habitId, day])
+  @@index([ownerId, day])
 }

@@ -1,13 +1,19 @@
 import { it, expect, vi, afterEach } from "vitest";
-const { parse, claudeParse, generate, groqCreate, clientOptions } = vi.hoisted(
-  () => ({
-    groqCreate: vi.fn(),
-    clientOptions: vi.fn(),
-    parse: vi.fn(),
-    claudeParse: vi.fn(),
-    generate: vi.fn(),
-  }),
-);
+const {
+  parse,
+  claudeParse,
+  generate,
+  groqCreate,
+  clientOptions,
+  transcribeCreate,
+} = vi.hoisted(() => ({
+  transcribeCreate: vi.fn(),
+  groqCreate: vi.fn(),
+  clientOptions: vi.fn(),
+  parse: vi.fn(),
+  claudeParse: vi.fn(),
+  generate: vi.fn(),
+}));
 vi.mock("openai", () => ({
   default: class {
     constructor(options: unknown) {
@@ -15,7 +21,13 @@ vi.mock("openai", () => ({
     }
     chat = { completions: { create: groqCreate } };
     responses = { parse };
+    audio = { transcriptions: { create: transcribeCreate } };
   },
+  toFile: async (data: Buffer, name: string, options?: { type?: string }) => ({
+    data,
+    name,
+    type: options?.type,
+  }),
 }));
 vi.mock("@anthropic-ai/sdk", () => ({
   default: class {
@@ -36,6 +48,8 @@ import {
   visionTargets,
 } from "@/services/ai";
 import { readReceipt } from "@/services/receipts";
+import { spokenAmounts } from "@/services/ai";
+import { transcribe, transcribeTargets } from "@/services/voice";
 function only(provider: "groq" | "openai" | "anthropic" | "gemini" | "") {
   for (const name of [
     "OPENAI_API_KEY",
@@ -49,6 +63,8 @@ function only(provider: "groq" | "openai" | "anthropic" | "gemini" | "") {
     "GROQ_MODEL",
     "GROQ_VISION_MODEL",
     "AI_VISION_PROVIDER",
+    "GROQ_TRANSCRIBE_MODEL",
+    "AI_TRANSCRIBE_PROVIDER",
   ])
     vi.stubEnv(name, "");
   if (provider === "groq") {
@@ -498,4 +514,71 @@ it("tries the next text provider on a rate limit and says so when all are limite
   expect((await interpret("Pengeluaran 35000 makan siang")).intent).toBe(
     "create_transaction",
   );
+});
+it("reads amounts spoken or written as Indonesian words", () => {
+  expect(spokenAmounts("pengeluaran lima puluh ribu buat makan")).toEqual([
+    "50000",
+  ]);
+  expect(spokenAmounts("seratus dua puluh lima ribu")).toEqual(["125000"]);
+  expect(spokenAmounts("satu juta dua ratus ribu")).toEqual(["1200000"]);
+  expect(spokenAmounts("dua ratus lima belas ribu")).toEqual(["215000"]);
+  expect(spokenAmounts("sejuta")).toEqual(["1000000"]);
+  // A scale word alone is not an amount.
+  expect(spokenAmounts("beberapa ribu orang")).toEqual([]);
+});
+it("accepts a model amount the user said in words", async () => {
+  only("groq");
+  const body = intent("create_transaction", {
+    type: "expense",
+    amount: "50000",
+    currency: "IDR",
+    title: "Makan siang",
+  });
+  groqCreate.mockResolvedValueOnce({
+    choices: [
+      { finish_reason: "stop", message: { content: JSON.stringify(body) } },
+    ],
+  });
+  expect(await interpret("makan siang lima puluh ribu")).toEqual(body);
+});
+it("transcribes with Groq Whisper first and falls back to Gemini audio", async () => {
+  only("groq");
+  vi.stubEnv("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-turbo");
+  vi.stubEnv("GEMINI_API_KEY", "test-only");
+  vi.stubEnv("GEMINI_MODEL", "gemini-test");
+  vi.stubEnv("AI_TRANSCRIBE_PROVIDER", "groq,gemini,anthropic");
+  expect(transcribeTargets()).toEqual([
+    { provider: "groq", model: "whisper-large-v3-turbo" },
+    { provider: "gemini", model: "gemini-test" },
+  ]);
+  const audio = { data: Buffer.from("ogg-bytes"), mime: "audio/ogg" };
+  transcribeCreate.mockResolvedValueOnce({ text: "  bayar  parkir 5 ribu " });
+  expect(await transcribe(audio)).toBe("bayar parkir 5 ribu");
+  const request = transcribeCreate.mock.calls[0][0];
+  expect(request).toMatchObject({
+    model: "whisper-large-v3-turbo",
+    language: "id",
+  });
+  expect(request.prompt).toContain("digit");
+  expect(request.file.name).toBe("voice.ogg");
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  transcribeCreate.mockRejectedValueOnce(
+    Object.assign(new Error("429"), { status: 429 }),
+  );
+  generate.mockResolvedValueOnce(gemini("STOP", "bensin 30 ribu"));
+  expect(await transcribe(audio)).toBe("bensin 30 ribu");
+  expect(generate.mock.calls[0][0].contents[0].parts[0].inlineData).toEqual({
+    mimeType: "audio/ogg",
+    data: audio.data.toString("base64"),
+  });
+  transcribeCreate.mockRejectedValueOnce(
+    Object.assign(new Error("429"), { status: 429 }),
+  );
+  generate.mockRejectedValueOnce(
+    Object.assign(new Error("429"), { status: 429 }),
+  );
+  await expect(transcribe(audio)).rejects.toThrow("batas pemakaian");
+  vi.stubEnv("AI_TRANSCRIBE_PROVIDER", "anthropic");
+  await expect(transcribe(audio)).rejects.toThrow("belum diatur");
+  vi.restoreAllMocks();
 });

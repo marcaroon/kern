@@ -40,6 +40,15 @@ export const intentSchema = z.object({
     "list_bills",
     "cancel_bill",
     "finance_insight",
+    "create_goal",
+    "add_saving",
+    "withdraw_saving",
+    "list_goals",
+    "cancel_goal",
+    "create_habit",
+    "log_habit",
+    "list_habits",
+    "cancel_habit",
     "help",
     "general",
     "clarify",
@@ -124,12 +133,70 @@ export function amountsIn(text: string): string[] {
     .matchAll(
       /(?<![\d.,-])(?:rp\s*)?(\d{1,3}(?:\.\d{3})+|\d+)(?:\s*(ribu|rb|juta|jt))?(?![\d.,])/g,
     );
-  return [...matches].map((m) =>
-    (
-      BigInt(m[1].replaceAll(".", "")) *
-      (m[2] === "ribu" || m[2] === "rb" ? 1000n : m[2] ? 1000000n : 1n)
-    ).toString(),
-  );
+  return [
+    ...[...matches].map((m) =>
+      (
+        BigInt(m[1].replaceAll(".", "")) *
+        (m[2] === "ribu" || m[2] === "rb" ? 1000n : m[2] ? 1000000n : 1n)
+      ).toString(),
+    ),
+    ...spokenAmounts(text),
+  ];
+}
+const units: Record<string, bigint> = {
+  nol: 0n,
+  satu: 1n,
+  dua: 2n,
+  tiga: 3n,
+  empat: 4n,
+  lima: 5n,
+  enam: 6n,
+  tujuh: 7n,
+  delapan: 8n,
+  sembilan: 9n,
+  sepuluh: 10n,
+  sebelas: 11n,
+  seratus: 100n,
+};
+const scales: Record<string, bigint> = {
+  ribu: 1000n,
+  juta: 1000000n,
+  miliar: 1000000000n,
+};
+// Amounts written or transcribed as Indonesian words: "lima puluh ribu" -> 50000,
+// "seratus dua puluh lima ribu" -> 125000, "satu juta dua ratus ribu" -> 1200000.
+export function spokenAmounts(text: string): string[] {
+  const words = text.toLowerCase().match(/[a-z]+/g) ?? [];
+  const found: string[] = [];
+  let total = 0n,
+    small = 0n,
+    active = false;
+  const flush = () => {
+    if (active && total + small > 0n) found.push((total + small).toString());
+    total = small = 0n;
+    active = false;
+  };
+  for (const word of words) {
+    const unit = small % 10n;
+    if (word in units) small += units[word];
+    else if (word === "belas" && active) small += 10n;
+    else if (word === "puluh" && active) small += unit * 9n;
+    else if (word === "ratus" && active) small += unit * 99n;
+    else if (
+      (word in scales && active) ||
+      ["seribu", "sejuta", "semiliar"].includes(word)
+    ) {
+      const scale = scales[word] ?? scales[word.slice(2)];
+      total += (word.startsWith("se") ? 1n : small || 1n) * scale;
+      small = 0n;
+    } else {
+      flush();
+      continue;
+    }
+    active = true;
+  }
+  flush();
+  return found;
 }
 export function fallback(
   text: string,
@@ -225,6 +292,10 @@ export function fallback(
     return intent("list_debts");
   if (/^(daftar )?tagihan( (rutin|bulan ini|apa aja))?\??$/.test(lower))
     return intent("list_bills");
+  if (/^(target )?tabungan( ?ku| saya)?\??$|^progres tabungan/.test(lower))
+    return intent("list_goals");
+  if (/^(kebiasaan|habit|streak)( ?ku| saya)?\??$/.test(lower))
+    return intent("list_habits");
   if (
     /^(insight|analisis) keuangan|boros (gak|nggak|ga)|gimana keuangan/.test(
       lower,
@@ -316,6 +387,8 @@ function instructions(now: Date, zone: string) {
     "split_bill: the user wants to split a bill or receipt (split, patungan, bagi rata, bayarin, masing-masing). Put the complete splitting instruction in content (who had what, how many people), merging corrections with earlier split instructions from the history (e.g. 'Budi juga minum es teh' adds to the earlier assignment); amount only if the user states the total in this text, title for what it was. A receipt photo sent just before may be the bill.",
     "Debts (utang/piutang, minjem, pinjam, nalangin, talangin): create_debt when someone owes the user (direction owed_to_me, e.g. 'Budi minjem 50rb') or the user owes someone (i_owe, e.g. 'aku utang 100rb ke Sari'); person is the other person's name (never the user), title what it was for. direction is always required for create_debt: i_owe when the user borrowed or owes (aku/saya/gue utang/minjem/pinjam ke X, ditalangin X), owed_to_me when the other person borrowed or owes the user (X minjem/utang ke aku, aku talangin X). settle_debt when a debt is paid back fully or partly ('Budi udah bayar', 'Budi transfer 20rb', 'aku udah bayar ke Sari'); amount only if a partial amount is stated. list_debts for who owes whom; direction optional. Debts are not income or expense.",
     "Bills: create_bill for a recurring monthly bill or subscription ('tagihan internet 350rb tiap tanggal 5', 'Netflix 65rb tiap tgl 12'); title is the bill name, day the due day 1-31, amount null when it varies (listrik). pay_bill when the user paid one ('udah bayar internet', 'internet udah dibayar', 'bayar listrik 450rb'); title is the bill name; amount only if stated. A short message naming a bill as paid is pay_bill, not clarify. list_bills for upcoming bills; cancel_bill to stop one (requires confirmation).",
+    "Savings goals (target tabungan): create_goal ('nabung 5jt buat laptop sampai Maret'): title is the goal name, amount the target, date the deadline if given (end of that day). add_saving when the user puts money aside for a goal ('nabung 500rb buat laptop', 'tabungan laptop tambah 200rb'); withdraw_saving when taking money out of it; title is the goal name (null if none named), amount the sum. list_goals for progress; cancel_goal to drop one (requires confirmation). Savings are not income or expense.",
+    "Habits (kebiasaan): create_habit for a daily habit the user wants to track or be checked on ('pantau olahraga tiap hari', 'cek minum air jam 8 malam'); title is the short habit name (Olahraga, Minum air); when a time is mentioned (jam 7 malam, 06.30) date must be today at that local time as ISO with offset, else null. log_habit when the user reports doing it ('udah olahraga hari ini') or not doing it ('hari ini nggak olahraga', 'skip minum air dulu', 'belum sempat baca buku'): title is the habit name, status completed when done or cancelled when skipped; do not clarify these. list_habits for streaks and progress; cancel_habit to stop tracking (requires confirmation). One-off reminders stay create_reminder.",
     "finance_insight: questions about how the user's money is doing, spending habits, whether they are overspending, remaining budget per day.",
     "Records: match tasks/notes by query if no explicit UUID. Updates, cancellation, archiving, budget changes and financial corrections require confirmation. For finance questions choose a period. Personal questions about stored data use the database intents, never general.",
     "general: greetings, thanks, small talk and general questions. Answer helpfully and to the point (usually 1-4 sentences, up to about 120 words for advice), never claim a stored fact or a completed action, and do not infer personal data. Mention that advice is general when it matters (money, health, law).",

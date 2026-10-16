@@ -2,6 +2,7 @@ import type { Tx } from "@/lib/db";
 import { dateRange, displayDate } from "@/lib/time";
 import { financeSummary, budgetStatus, categoryLabel, rupiah } from "./finance";
 import { financeInsights } from "./insights";
+import { habitWeekSummary } from "./habits";
 export async function dashboard(
   tx: Tx,
   ownerId: string,
@@ -86,7 +87,7 @@ export async function report(
   zone = "Asia/Jakarta",
 ) {
   const range = dateRange(kind === "weekly" ? "week" : "today", now, zone);
-  const [money, tasks, completed, notes, reminders, budgets, insights] =
+  const [money, tasks, completed, notes, reminders, budgets, insights, habits] =
     await Promise.all([
       financeSummary(
         tx,
@@ -123,6 +124,9 @@ export async function report(
       }),
       budgetStatus(tx, ownerId, now, zone),
       financeInsights(tx, ownerId, now, zone),
+      kind === "weekly"
+        ? habitWeekSummary(tx, ownerId, now, zone)
+        : Promise.resolve([]),
     ]);
   // Mornings show only what needs attention; the weekly review shows everything.
   const shown = insights.filter(
@@ -139,6 +143,7 @@ export async function report(
     ...Object.entries(money.categories).map(
       ([name, amount]) => `${categoryLabel(name)}: ${rupiah(amount)}`,
     ),
+    ...(habits.length ? ["", "Kebiasaan 7 hari terakhir:", ...habits] : []),
     ...(shown.length
       ? ["", "Insight keuangan:", ...shown.map((i) => i.text), ""]
       : []),

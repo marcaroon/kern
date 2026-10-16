@@ -3,6 +3,7 @@ import type { Tx } from "@/lib/db";
 import { budgetStatus, categoryLabel, rupiah } from "./finance";
 import { upcomingBills } from "./bills";
 import { debtSummary } from "./debts";
+import { behindSchedule, goalLine, weeklyNeed } from "./goals";
 
 // One decimal place without floating point: 18 -> "1,8".
 const ratio = (part: bigint, whole: bigint) => {
@@ -22,7 +23,7 @@ export async function financeInsights(
   const today = local.startOf("day");
   const weekStart = today.minus({ days: 6 });
   const baseStart = weekStart.minus({ days: 28 });
-  const [budgets, recent, bills, debts] = await Promise.all([
+  const [budgets, recent, bills, debts, goals] = await Promise.all([
     budgetStatus(tx, ownerId, now, zone),
     tx.transaction.findMany({
       where: {
@@ -36,6 +37,10 @@ export async function financeInsights(
     upcomingBills(tx, ownerId, today.plus({ days: 8 }).toJSDate()),
     tx.debt.findMany({
       where: { ownerId, status: "open" },
+      orderBy: { createdAt: "asc" },
+    }),
+    tx.goal.findMany({
+      where: { ownerId, status: "active" },
       orderBy: { createdAt: "asc" },
     }),
   ]);
@@ -126,6 +131,19 @@ export async function financeInsights(
       level: "info",
       text: `💸 Utangmu yang belum dibayar: ${rupiah(iOwe)}.`,
     });
+
+  // Savings goals: behind the straight line to the deadline, or just progress.
+  for (const g of goals) {
+    const need = weeklyNeed(g, now);
+    insights.push(
+      behindSchedule(g, now)
+        ? {
+            level: "alert",
+            text: `🎯 Target ${g.name} agak ketinggalan: baru ${rupiah(g.saved)} dari ${rupiah(g.target)}.${need ? ` Perlu sekitar ${rupiah(need)} per minggu biar tetap tercapai.` : ""}`,
+          }
+        : { level: "info", text: goalLine(g, now, zone) },
+    );
+  }
   return insights;
 }
 export async function insightText(

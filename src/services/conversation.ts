@@ -27,6 +27,9 @@ import {
   saveBill,
 } from "./bills";
 import { insightText } from "./insights";
+import { cancelGoal, changeSaving, listGoals, saveGoal } from "./goals";
+import { cancelHabit, listHabits, logHabit, saveHabit } from "./habits";
+import { similarNotes } from "./semantic";
 import { handleSplitRequest, receiptDeps, type ReceiptDeps } from "./receipts";
 import { saveTask, saveNote, saveReminder, resolveMatch } from "./records";
 import { report } from "./reporting";
@@ -47,9 +50,17 @@ const destructive = new Set([
   "set_budget",
   "settle_debt",
   "cancel_bill",
+  "cancel_goal",
+  "cancel_habit",
 ]);
 // Confirmed intents that act on a person or a bill name instead of a stored record.
-const untargeted = new Set(["set_budget", "settle_debt", "cancel_bill"]);
+const untargeted = new Set([
+  "set_budget",
+  "settle_debt",
+  "cancel_bill",
+  "cancel_goal",
+  "cancel_habit",
+]);
 const help = [
   "Hai! 👋 Aku KERN, asisten pribadimu. Ngobrol aja kayak biasa, misalnya:",
   "💸 “makan siang 35rb pakai QRIS” atau “gajian 8jt”",
@@ -58,6 +69,9 @@ const help = [
   "🤝 “Budi minjem 50rb buat tiket” · “Budi udah bayar” · “siapa aja yang masih utang?”",
   "🔔 “tagihan internet 350rb tiap tanggal 5” · “tagihan bulan ini”",
   "📈 “gimana keuanganku bulan ini?”",
+  "🎯 “nabung 5jt buat laptop sampai Maret” · “nabung 200rb buat laptop”",
+  "🔥 “pantau olahraga tiap hari jam 7 malam” · “udah olahraga hari ini”",
+  "🎙️ Kirim voice note, aku dengarkan dan catat",
   "✅ “tambah task revisi dashboard”",
   "⏰ “ingatkan besok jam 9 pagi buat follow up vendor”",
   "💡 “catat ide: SaaS klinik hewan”",
@@ -112,6 +126,8 @@ const labels: Record<string, string> = {
   cancelled: "dibatalkan",
   settle_debt: "catat pelunasan utang",
   cancel_bill: "hapus tagihan rutin",
+  cancel_goal: "hapus target tabungan",
+  cancel_habit: "berhenti memantau kebiasaan",
   person: "Orang",
   direction: "Arah",
   day: "Tanggal",
@@ -298,6 +314,50 @@ export async function executeIntent(
       return cancelBill(tx, ownerId, e.title || e.query);
     case "finance_insight":
       return insightText(tx, ownerId, now, zone);
+    case "create_goal":
+      if (!e.title || !e.amount)
+        return "Mau nabung buat apa dan targetnya berapa? Contoh: “nabung 5jt buat laptop sampai Maret”.";
+      return saveGoal(
+        tx,
+        ownerId,
+        { name: e.title, target: e.amount, deadline: e.date },
+        now,
+        zone,
+      );
+    case "add_saving":
+    case "withdraw_saving":
+      if (!e.amount)
+        return "Berapa nominalnya? Contoh: “nabung 200rb buat laptop”.";
+      return changeSaving(
+        tx,
+        ownerId,
+        e.title || e.query,
+        e.amount,
+        input.intent === "add_saving" ? 1n : -1n,
+        now,
+        zone,
+      );
+    case "list_goals":
+      return listGoals(tx, ownerId, now, zone);
+    case "cancel_goal":
+      return cancelGoal(tx, ownerId, e.title || e.query);
+    case "create_habit":
+      if (!e.title)
+        return "Kebiasaan apa yang mau dipantau? Contoh: “pantau olahraga tiap hari jam 7 malam”.";
+      return saveHabit(tx, ownerId, { name: e.title, at: e.date }, zone);
+    case "log_habit":
+      return logHabit(
+        tx,
+        ownerId,
+        { name: e.title || e.query },
+        e.status !== "cancelled",
+        now,
+        zone,
+      );
+    case "list_habits":
+      return listHabits(tx, ownerId, now, zone);
+    case "cancel_habit":
+      return cancelHabit(tx, ownerId, e.title || e.query);
     case "create_transaction": {
       if (e.currency !== "IDR")
         return "Aku cuma bisa mencatat dalam rupiah (IDR). Boleh tulis nominal rupiahnya?";
@@ -515,10 +575,21 @@ export async function executeIntent(
         orderBy: { createdAt: "desc" },
         take: 5,
       });
-      return rows.length
-        ? `Ketemu ${rows.length} catatan:\n\n${rows
+      // Notes close in meaning fill the list after exact keyword matches.
+      const similar = query
+        ? (await similarNotes(tx, ownerId, query)).filter(
+            (n) => !rows.some((r) => r.id === n.id),
+          )
+        : [];
+      const found = [
+        ...rows.map((r) => ({ ...r, related: false })),
+        ...similar.map((n) => ({ ...n, related: true })),
+      ].slice(0, 5);
+      return found.length
+        ? `Ketemu ${found.length} catatan:\n\n${found
             .map(
-              (r) => `📝 ${r.title}\n${r.content.slice(0, 500)}\nID: ${r.id}`,
+              (r) =>
+                `📝 ${r.title}${r.related ? " (mirip maknanya)" : ""}\n${r.content.slice(0, 500)}\nID: ${r.id}`,
             )
             .join("\n\n")}`
         : "Tidak ditemukan dalam catatan yang kamu simpan.";

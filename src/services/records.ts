@@ -63,8 +63,12 @@ export async function saveNote(
     ? await tx.note.findFirst({ where: { id, ownerId } })
     : null;
   if (id && !before) throw new AppError("NOTE_NOT_FOUND", 404);
+  // Edited text needs a fresh vector; the scheduled backfill re-embeds it.
   const result = id
-    ? await tx.note.update({ where: { id }, data })
+    ? await tx.note.update({
+        where: { id },
+        data: { ...data, embedding: [], embeddingModel: null },
+      })
     : await tx.note.create({ data: { ...data, ownerId } });
   await audit(
     tx,

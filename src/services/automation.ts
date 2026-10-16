@@ -12,6 +12,8 @@ import { syncSheets } from "./sheets";
 import { report } from "./reporting";
 import { billReminders } from "./bills";
 import { debtNudges } from "./debts";
+import { habitCheckins } from "./habits";
+import { embedPendingNotes } from "./semantic";
 import { DateTime } from "luxon";
 import { AppError, safeCode } from "@/lib/errors";
 export async function automate(
@@ -35,6 +37,8 @@ export async function automate(
         reminders: await materializeReminders(database, now),
         bills: await billReminders(database, now, zone),
         debts: await debtNudges(database, now, zone),
+        habits: await habitCheckins(database, now, zone),
+        notes: await embedPendingNotes(database),
         messages: await dispatchMessages(database, telegramSender(), now),
       };
     }

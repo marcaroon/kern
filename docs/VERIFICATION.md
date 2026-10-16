@@ -79,7 +79,7 @@ The full development dependency audit reports five high-severity entries in the 
 
 ## Known product boundaries
 
-One owner, text messages and receipt photos, keyword memory and one action per message. Conversation context covers the last 30 minutes only. Dashboard timezone is WIB. Missing/uncertain provider deliveries need operator configuration/reconciliation. The managed Sheets tab requires fixed rows. Split bills record the owner's share as an expense and friends' shares as debts; settling a debt is not income. Voice, Calendar, email and semantic retrieval are roadmap features, not implemented capabilities.
+One owner, text messages and receipt photos, keyword memory and one action per message. Conversation context covers the last 30 minutes only. Dashboard timezone is WIB. Missing/uncertain provider deliveries need operator configuration/reconciliation. The managed Sheets tab requires fixed rows. Split bills record the owner's share as an expense and friends' shares as debts; settling a debt is not income. Calendar and email are roadmap features, not implemented capabilities. Meaning search scans notes in memory and suits a few thousand notes.
 
 ## Friendlier chat, receipts and split bill (15 October 2026)
 
@@ -104,3 +104,11 @@ Migration `202610150002_debts_bills` adds `Debt` and `Bill` (RLS enabled, CHECK 
 Live intent check against Groq `openai/gpt-oss-20b` with synthetic sentences: debt creation (both directions after a prompt fix), settlement with a partial amount, debt listing, fixed and variable bill creation, bill payment and the insight question were classified correctly; "Sari aku talangin makan 45rb" produced a clarifying question. Several requests in a burst hit Groq's 8,000 tokens-per-minute limit, which led to the provider chain and the honest rate-limit reply.
 
 **Not verified live:** Telegram inline buttons and callback delivery (requires re-registering the webhook with `callback_query`), debt nudges and bill reminders arriving through the production scheduler, and insight wording on real data.
+
+## Voice notes, goals, habits and meaning search (16 October 2026)
+
+Migration `202610160001_goals_habits_embeddings` adds `Goal`, `Habit`, `HabitLog` (RLS enabled) and `Note.embedding`/`embeddingModel`. 124 tests, lint, strict typecheck, Prettier, the production build and `npm run test:migrations` passed.
+
+Live checks: Groq lists `whisper-large-v3-turbo`; Gemini lists `gemini-embedding-001`. A synthetic clip from an English Windows TTS voice reading Indonesian was transcribed by Groq Whisper (0.9 s) and Gemini (2.6 s); both calls worked, but the wording was poor because of the English voice and the amount came out in words, which led to the number-word parser. Real Indonesian speech has not been tested. Six synthetic notes and queries calibrated the meaning-search threshold (see SETUP_AI). Groq `openai/gpt-oss-20b` classified goal creation (with a deadline), saving, goal progress, habit creation with a check-in time, done and skipped habit reports, and “makan siang lima puluh ribu” correctly after two prompt fixes.
+
+**Not verified live:** voice notes from Telegram, habit check-ins and buttons through the production scheduler, embeddings backfill on the production database, and meaning-search quality on the owner's real notes.

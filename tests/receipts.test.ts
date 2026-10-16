@@ -272,3 +272,22 @@ describe("fallback for new features", () => {
     );
   });
 });
+describe("goals helpers", () => {
+  it("draws progress and needs per week from integers", async () => {
+    const { progressBar, weeklyNeed } = await import("@/services/goals");
+    expect(progressBar(0n, 100n)).toBe("░░░░░░░░░░");
+    expect(progressBar(55n, 100n)).toBe("▓▓▓▓▓░░░░░");
+    expect(progressBar(200n, 100n)).toBe("▓▓▓▓▓▓▓▓▓▓");
+    const goal = {
+      id: "g",
+      name: "Laptop",
+      target: 1000n,
+      saved: 0n,
+      deadline: new Date(now.getTime() + 3 * 7 * 86400000),
+      status: "active",
+      createdAt: now,
+    };
+    expect(weeklyNeed(goal, now)).toBe(334n);
+    expect(weeklyNeed({ ...goal, deadline: null }, now)).toBeNull();
+  });
+});

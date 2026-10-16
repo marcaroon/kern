@@ -19,9 +19,11 @@ import {
   saveBudget,
   financeSummary,
 } from "@/services/finance";
-import { saveTask, saveReminder } from "@/services/records";
+import { saveTask, saveReminder, saveNote } from "@/services/records";
 import { ingestUpdates, pollUpdates } from "@/integrations/telegram";
-import { processInbox } from "@/services/inbox";
+import { processInbox, type VoiceDeps } from "@/services/inbox";
+import { habitCheckins } from "@/services/habits";
+import { embedPendingNotes, similarNotes } from "@/services/semantic";
 import { fallback, intent, type Intent, type Turn } from "@/services/ai";
 import { debtNudges } from "@/services/debts";
 import { billReminders } from "@/services/bills";
@@ -70,7 +72,7 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   await db.$executeRawUnsafe(
-    'TRUNCATE "AuditLog", "Debt", "Bill", "BudgetAlert", "Budget", "SheetSyncOutbox", "Transaction", "Account", "Reminder", "Task", "Note", "PendingAction", "Job", "InboxMessage", "Heartbeat" RESTART IDENTITY CASCADE',
+    'TRUNCATE "AuditLog", "Debt", "Bill", "Goal", "HabitLog", "Habit", "BudgetAlert", "Budget", "SheetSyncOutbox", "Transaction", "Account", "Reminder", "Task", "Note", "PendingAction", "Job", "InboxMessage", "Heartbeat" RESTART IDENTITY CASCADE',
   );
 });
 const transaction = (amount = "35000") => ({
@@ -1321,5 +1323,250 @@ describe("buttons, debts, bills and insights", () => {
     );
     expect(morning).toContain("Insight keuangan:");
     expect(morning).not.toContain("🟢");
+  });
+});
+describe("voice notes, savings goals, habits and meaning search", () => {
+  const zone = "Asia/Jakarta";
+  const wib = (iso: string) => new Date(`${iso}+07:00`);
+  const voiceUpdate = (messageId: number, duration = 4) => ({
+    update_id: updateId++,
+    message: {
+      message_id: messageId,
+      date: now.getTime() / 1000,
+      chat: { id: ownerChat, type: "private" },
+      from: { id: ownerChat, is_bot: false },
+      voice: {
+        file_id: "voice-file",
+        duration,
+        mime_type: "audio/ogg",
+        file_size: 9000,
+      },
+    },
+  });
+  const tap = (data: string) => ({
+    update_id: updateId++,
+    callback_query: {
+      id: `cb${updateId}`,
+      from: { id: ownerChat, is_bot: false },
+      data,
+      message: { message_id: 700, chat: { id: ownerChat, type: "private" } },
+    },
+  });
+  const voice = (transcript: string | Error): VoiceDeps => ({
+    download: vi.fn(async () => Buffer.from("ogg")),
+    transcribe: vi.fn(async () => {
+      if (transcript instanceof Error) throw transcript;
+      return transcript;
+    }),
+  });
+  const media: ReceiptDeps = {
+    download: vi.fn(),
+    read: vi.fn(),
+    plan: planSplit,
+  };
+  const run = (deps: VoiceDeps, at = now) =>
+    processInbox(db, at, zone, parse, 10, media, deps);
+  const texts = async () =>
+    (await db.job.findMany({ orderBy: { createdAt: "asc" } })).map(
+      (j) =>
+        j.payload as {
+          text: string;
+          buttons?: { text: string; data: string }[][];
+        },
+    );
+  const act = (input: Intent, at = now, confirmed = false) =>
+    db.$transaction((tx) =>
+      executeIntent(tx, owner, input, "m", at, zone, confirmed),
+    );
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("transcribes a voice note and acts on the words, keeping only the text", async () => {
+    await ingest(voiceUpdate(100), voiceUpdate(101, 400));
+    const stored = await db.inboxMessage.findMany({ orderBy: { id: "asc" } });
+    expect(stored[0]).toMatchObject({ fileMime: "audio/ogg", text: "" });
+    expect(stored[1].text).toBe("[AUDIO_TOO_LONG]");
+    const deps = voice("Pengeluaran 50000 makan siang");
+    await run(deps);
+    expect(deps.download).toHaveBeenCalledWith("voice-file");
+    expect((await db.transaction.findFirstOrThrow()).amount).toBe(50000n);
+    const [first, second] = await texts();
+    expect(first.text).toMatch(/^🎙️ “Pengeluaran 50000 makan siang”\n\n✅/);
+    expect(second.text).toContain("kepanjangan");
+    expect(
+      (await db.inboxMessage.findUniqueOrThrow({ where: { id: stored[0].id } }))
+        .text,
+    ).toBe("Pengeluaran 50000 makan siang");
+  });
+  it("lets a spoken “iya” answer a pending question and reports failures", async () => {
+    await act(
+      intent("create_bill", { title: "Internet", amount: "350000", day: 20 }),
+    );
+    await act(intent("cancel_bill", { title: "Internet" }));
+    await ingest(voiceUpdate(102));
+    await run(voice("Iya."));
+    expect((await db.bill.findFirstOrThrow()).status).toBe("cancelled");
+    await ingest(voiceUpdate(103));
+    await run(
+      voice(new AppError("TRANSCRIBE_UNAVAILABLE", 503, "gagal mendengarkan")),
+    );
+    expect((await texts()).at(-1)?.text).toContain("gagal mendengarkan");
+    await ingest(voiceUpdate(104));
+    await run(voice(""));
+    expect((await texts()).at(-1)?.text).toContain("nggak menangkap ucapan");
+  });
+  it("tracks savings goals without touching income or expense", async () => {
+    const created = await act(
+      intent("create_goal", {
+        title: "Laptop",
+        amount: "5000000",
+        date: "2026-12-31T00:00:00+07:00",
+      }),
+    );
+    expect(created).toContain("Rp416.667 per minggu");
+    const deposit = await act(
+      intent("add_saving", { title: "laptop", amount: "1000000" }),
+    );
+    expect(deposit).toContain("Rp1.000.000 / Rp5.000.000 (20%)");
+    expect(deposit).toContain("▓▓░░░░░░░░");
+    await expect(
+      act(intent("withdraw_saving", { title: "Laptop", amount: "2000000" })),
+    ).rejects.toThrow("nggak bisa diambil");
+    // With a single goal the name may be omitted.
+    expect(await act(intent("add_saving", { amount: "4000000" }))).toContain(
+      "tercapai",
+    );
+    expect((await db.goal.findFirstOrThrow()).achievedAt).toEqual(now);
+    await act(intent("create_goal", { title: "Liburan", amount: "3000000" }));
+    await expect(act(intent("add_saving", { amount: "1000" }))).rejects.toThrow(
+      "Buat target yang mana",
+    );
+    expect(await db.transaction.count()).toBe(0);
+    expect(await act(intent("list_goals"))).toContain("Liburan");
+  });
+  it("flags a goal that trails its deadline in insights", async () => {
+    const start = new Date(now.getTime() - 30 * 86400000);
+    await act(
+      intent("create_goal", {
+        title: "Motor",
+        amount: "3000000",
+        date: new Date(start.getTime() + 60 * 86400000).toISOString(),
+      }),
+      start,
+    );
+    expect(await act(intent("finance_insight"))).toContain(
+      "🎯 Target Motor agak ketinggalan",
+    );
+  });
+  it("checks in on habits once a day after their time and counts streaks", async () => {
+    await act(
+      intent("create_habit", {
+        title: "Olahraga",
+        date: "2026-10-12T19:00:00+07:00",
+      }),
+    );
+    const habit = await db.habit.findFirstOrThrow();
+    expect(habit.checkinTime).toBe("19:00");
+    await habitCheckins(db, wib("2026-10-12T18:59:00"), zone);
+    expect(await db.job.count()).toBe(0);
+    await habitCheckins(db, wib("2026-10-12T19:00:00"), zone);
+    await habitCheckins(db, wib("2026-10-12T21:00:00"), zone);
+    const [checkin] = await texts();
+    expect(await db.job.count()).toBe(1);
+    expect(checkin.buttons?.[0].map((b) => b.data)).toEqual([
+      `done:${habit.id}`,
+      `skip:${habit.id}`,
+    ]);
+    await ingest(tap(`done:${habit.id}`));
+    await run(voice(""), wib("2026-10-12T21:05:00"));
+    expect((await texts()).at(-1)?.text).toContain(
+      "Olahraga hari ini tercatat",
+    );
+    // The next day, a typed report extends the streak and stops the check-in.
+    expect(
+      await act(
+        intent("log_habit", { title: "olahraga" }),
+        wib("2026-10-13T07:00:00"),
+      ),
+    ).toContain("Streak 2 hari");
+    await habitCheckins(db, wib("2026-10-13T20:00:00"), zone);
+    expect(await db.job.count()).toBe(2);
+    // Skipping is recorded, and the latest answer for a day wins.
+    await act(
+      intent("log_habit", { title: "Olahraga", status: "cancelled" }),
+      wib("2026-10-14T20:00:00"),
+    );
+    expect(
+      await act(intent("list_habits"), wib("2026-10-14T21:00:00")),
+    ).toContain("⏭️ Olahraga — 7 hari terakhir 2/7");
+    expect(
+      await db.$transaction((tx) =>
+        report(tx, owner, "weekly", wib("2026-10-14T21:00:00"), zone),
+      ),
+    ).toContain("• Olahraga: 2/7 hari");
+  });
+  it("embeds pending notes once and finds notes by meaning", async () => {
+    vi.stubEnv("GEMINI_API_KEY", "test-only");
+    vi.stubEnv("GEMINI_EMBEDDING_MODEL", "embedding-test");
+    // A unit vector whose similarity with the query [1, 0, ...] equals score.
+    const vector = (score: number) => [
+      score,
+      Math.sqrt(1 - score * score),
+      ...Array<number>(254).fill(0),
+    ];
+    const scores: Record<string, number> = {
+      "SaaS klinik hewan": 0.9,
+      "Grooming kucing": 0.88,
+      "Resep rendang": 0.7,
+      Arsip: 0.95,
+    };
+    const embedder = vi.fn(async (texts: string[], kind: string) =>
+      kind === "query"
+        ? [vector(1)]
+        : texts.map((t) => vector(scores[t.split("\n")[0]] ?? 0)),
+    );
+    await db.$transaction(async (tx) => {
+      for (const title of Object.keys(scores))
+        await saveNote(tx, owner, {
+          title,
+          content: title,
+          archived: title === "Arsip",
+        });
+      await tx.note.create({
+        data: { ownerId: "another-owner", title: "Kucing", content: "x" },
+      });
+    });
+    expect((await embedPendingNotes(db, 20, embedder)).embedded).toBe(4);
+    expect((await embedPendingNotes(db, 20, embedder)).embedded).toBe(0);
+    const found = await db.$transaction((tx) =>
+      similarNotes(tx, owner, "ide soal hewan peliharaan", 5, embedder),
+    );
+    // Above the minimum and close to the best; archived and other owners excluded.
+    expect(found.map((n) => n.title)).toEqual([
+      "SaaS klinik hewan",
+      "Grooming kucing",
+    ]);
+    // Editing a note clears its vector so the backfill embeds the new text.
+    const note = await db.note.findFirstOrThrow({
+      where: { title: "Resep rendang" },
+    });
+    await db.$transaction((tx) =>
+      saveNote(tx, owner, { title: "Resep rendang", content: "baru" }, note.id),
+    );
+    expect(
+      (await db.note.findUniqueOrThrow({ where: { id: note.id } }))
+        .embeddingModel,
+    ).toBeNull();
+    expect((await embedPendingNotes(db, 20, embedder)).embedded).toBe(1);
+    // A provider failure stores nothing and is reported.
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await db.$transaction((tx) =>
+      saveNote(tx, owner, { title: "Baru", content: "baru" }),
+    );
+    expect(
+      await embedPendingNotes(db, 20, async () => {
+        throw Object.assign(new Error("429"), { status: 429 });
+      }),
+    ).toMatchObject({ embedded: 0, failed: true });
+    vi.restoreAllMocks();
   });
 });

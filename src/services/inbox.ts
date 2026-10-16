@@ -11,7 +11,19 @@ import {
 import { latestPending } from "./pending";
 import { settleDebts, settledText } from "./debts";
 import { payBill } from "./bills";
+import { logHabit } from "./habits";
 import { handleReceiptPhoto, receiptDeps, type ReceiptDeps } from "./receipts";
+import { transcribe, type Audio } from "./voice";
+import { downloadTelegramFile, maxAudioBytes } from "@/integrations/telegram";
+
+export type VoiceDeps = {
+  download: (fileId: string) => Promise<Buffer>;
+  transcribe: (audio: Audio) => Promise<string>;
+};
+const voiceDeps: VoiceDeps = {
+  download: (fileId) => downloadTelegramFile(fileId, fetch, maxAudioBytes),
+  transcribe,
+};
 import { enqueue, retryAt, type Outbound } from "./queue";
 
 export async function processInbox(
@@ -21,6 +33,7 @@ export async function processInbox(
   parser: Parser = interpret,
   limit = 10,
   media: ReceiptDeps = receiptDeps,
+  voice: VoiceDeps = voiceDeps,
 ) {
   let processed = 0;
   for (let i = 0; i < limit; i++) {
@@ -40,7 +53,7 @@ export async function processInbox(
         let reply: string;
         let buttons: Outbound["buttons"];
         try {
-          reply = await route(tx, msg, now, zone, parser, media);
+          reply = await route(tx, msg, now, zone, parser, media, voice);
           // A new question gets one-tap answers; typing "ya"/"batal" still works.
           const proposal = await latestPending(tx, msg.ownerId, now);
           const payload = proposal?.payload as Record<string, unknown> | null;
@@ -125,7 +138,7 @@ async function recentTurns(
     },
     orderBy: { receivedAt: "desc" },
     take: 6,
-    select: { id: true, text: true, fileId: true },
+    select: { id: true, text: true, fileId: true, fileMime: true },
   });
   if (!rows.length) return [];
   const replies = await tx.job.findMany({
@@ -141,9 +154,11 @@ async function recentTurns(
   return rows.reverse().map((r) => {
     const reply = byKey.get(`reply:${r.id}`);
     return {
-      user: r.fileId
-        ? `[mengirim foto nota${r.text ? `, caption: ${r.text}` : ""}]`
-        : r.text,
+      user: r.fileMime?.startsWith("audio/")
+        ? `[voice note] ${r.text}`
+        : r.fileId
+          ? `[mengirim foto nota${r.text ? `, caption: ${r.text}` : ""}]`
+          : r.text,
       reply: typeof reply === "string" && reply !== "[REDACTED]" ? reply : null,
     };
   });
@@ -170,11 +185,36 @@ async function route(
   zone: string,
   parser: Parser,
   media: ReceiptDeps,
+  voice: VoiceDeps,
 ): Promise<string> {
   if (msg.text === "[UNSUPPORTED_MEDIA]")
     return "Aku bisa membaca teks dan foto nota, tapi belum bisa memproses voice note, video, atau file lain. Kirim dalam bentuk teks atau foto, ya.";
   if (msg.text === "[IMAGE_TOO_LARGE]")
     return "Fotonya terlalu besar buat aku baca (maks. 4 MB). Coba kirim sebagai foto biasa, bukan file, ya.";
+  if (msg.text === "[AUDIO_TOO_LONG]")
+    return "Voice note-nya kepanjangan buat aku (maks. 5 menit). Coba yang lebih singkat, ya.";
+  if (msg.fileId && msg.fileMime?.startsWith("audio/")) {
+    const transcript = await voice.transcribe({
+      data: await voice.download(msg.fileId),
+      mime: msg.fileMime,
+    });
+    if (!transcript)
+      return "Aku nggak menangkap ucapan apa pun di voice note itu. Coba rekam ulang, ya.";
+    // Keep the words, not the audio, so follow-ups have context.
+    await tx.inboxMessage.update({
+      where: { id: msg.id },
+      data: { text: transcript },
+    });
+    const reply = await understand(
+      tx,
+      { ...msg, text: transcript },
+      now,
+      zone,
+      parser,
+      media,
+    );
+    return `🎙️ “${transcript}”\n\n${reply}`;
+  }
   if (msg.fileId)
     return handleReceiptPhoto(
       tx,
@@ -187,7 +227,9 @@ async function route(
     );
   const command = msg.text
     .trim()
-    .match(/^(konfirmasi|batal|lunas|bayar tagihan) ([0-9a-f-]{36})$/i);
+    .match(
+      /^(konfirmasi|batal|lunas|bayar tagihan|habit selesai|habit lewat) ([0-9a-f-]{36})$/i,
+    );
   if (command) {
     const id = command[2];
     switch (command[1].toLowerCase()) {
@@ -197,10 +239,31 @@ async function route(
         return cancelProposal(tx, msg.ownerId, id, now);
       case "lunas":
         return settledText(await settleDebts(tx, msg.ownerId, { id }, now));
+      case "habit selesai":
+      case "habit lewat":
+        return logHabit(
+          tx,
+          msg.ownerId,
+          { id },
+          command[1].toLowerCase() === "habit selesai",
+          now,
+          zone,
+        );
       default:
         return payBill(tx, msg.ownerId, { id }, msg.id, now, zone);
     }
   }
+  return understand(tx, msg, now, zone, parser, media);
+}
+// Free text (typed or transcribed): a pending yes/no answer, else the AI parser.
+async function understand(
+  tx: Tx,
+  msg: { id: string; ownerId: string; text: string; receivedAt: Date },
+  now: Date,
+  zone: string,
+  parser: Parser,
+  media: ReceiptDeps,
+) {
   return (
     (await answerProposal(tx, msg.ownerId, msg.text, msg.id, now, zone)) ??
     executeIntent(

@@ -1,5 +1,6 @@
 import { it, expect, vi, afterEach, beforeEach } from "vitest";
 import {
+  messageAudio,
   acknowledgeCallbacks,
   buttonCommand,
   downloadTelegramImage,
@@ -224,7 +225,7 @@ it("retries a stalled image download once with a friendly error", async () => {
     down as unknown as typeof fetch,
   ).catch((e) => e);
   expect(down).toHaveBeenCalledTimes(2);
-  expect(error.message).toContain("mengambil fotonya");
+  expect(error.message).toContain("mengambil filenya");
 });
 it("sends inline buttons and maps only known button data to commands", async () => {
   const transport = reply(200, { ok: true, result: { message_id: 5 } });
@@ -279,4 +280,22 @@ it("answers owner button taps, removes the keyboard and ignores others", async (
   });
   expect(calls[2].body.text).toContain("sudah tidak berlaku");
   expect(JSON.stringify(calls)).not.toContain("3003");
+});
+it("accepts voice notes and audio within limits", () => {
+  const base = { message_id: 1, date: 1, chat: { id: 1, type: "private" } };
+  expect(
+    messageAudio({
+      ...base,
+      voice: { file_id: "v", duration: 30, mime_type: "audio/ogg" },
+    }),
+  ).toEqual({ fileId: "v", mime: "audio/ogg" });
+  expect(
+    messageAudio({ ...base, voice: { file_id: "v", duration: 301 } }),
+  ).toBe("too_large");
+  expect(
+    messageAudio({
+      ...base,
+      audio: { file_id: "a", duration: 5, mime_type: "video/mp4" },
+    }),
+  ).toBeNull();
 });

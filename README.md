@@ -59,6 +59,7 @@ The local worker polls Telegram and processes inbox, reminders, outbound message
 - One-time/daily/weekly/monthly reminders, original-day monthly clamping, one-occurrence catch-up, generation-based cancellation and persistent delivery status.
 - Telegram polling (or secret-token webhook), explicit user-ID allowlist for private chats, durable message deduplication and atomic domain action + reply enqueue.
 - Friendly conversational replies with 30-minute context, and plain `ya`/`batal` answers to confirmations.
+- Voice notes transcribed and handled like text; savings goals with weekly targets; daily habit check-ins with streaks; meaning-based note search ([details](docs/SETUP_AI.md#voice-notes-savings-goals-habits-and-meaning-search)).
 - One-tap Telegram buttons for confirmations; debts and repayments with collection nudges; monthly bills with reminders and one-tap payment; deterministic finance insights in chat and reports ([details](docs/SETUP_AI.md#buttons-debts-bills-and-insights)).
 - Receipt photos read by a vision model and recorded as income/expense after a `ya`; split bill from a receipt or a stated total, computed exactly in rupiah ([details](docs/SETUP_AI.md#receipt-photos-and-split-bill)).
 - Groq via the OpenAI-compatible API, or official OpenAI, Anthropic or Google Gemini SDK with schema-constrained structured output, business validation, confidence gating, expiring confirmations, and a small deterministic fallback.

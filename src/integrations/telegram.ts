@@ -3,6 +3,12 @@ import type { Database } from "@/lib/db";
 import { allowedTelegramIds, configured, required } from "@/lib/config";
 import { AppError } from "@/lib/errors";
 import { DeliveryError, type Outbound } from "@/services/queue";
+const audioSchema = z.object({
+  file_id: z.string().min(1).max(300),
+  duration: z.number().int(),
+  mime_type: z.string().optional(),
+  file_size: z.number().int().optional(),
+});
 const updateSchema = z.object({
   update_id: z.number().int(),
   message: z
@@ -30,6 +36,8 @@ const updateSchema = z.object({
           file_size: z.number().int().optional(),
         })
         .optional(),
+      voice: audioSchema.optional(),
+      audio: audioSchema.optional(),
     })
     .optional(),
   callback_query: z
@@ -52,9 +60,11 @@ const buttonCommands: Record<string, string> = {
   no: "batal",
   paid: "bayar tagihan",
   settle: "lunas",
+  done: "habit selesai",
+  skip: "habit lewat",
 };
 export function buttonCommand(data: string | undefined) {
-  const match = data?.match(/^(ok|no|paid|settle):([0-9a-f-]{36})$/);
+  const match = data?.match(/^(ok|no|paid|settle|done|skip):([0-9a-f-]{36})$/);
   return match ? `${buttonCommands[match[1]]} ${match[2]}` : null;
 }
 type Callback = NonNullable<z.infer<typeof updateSchema>["callback_query"]>;
@@ -97,6 +107,20 @@ export function messageImage(message: TelegramMessage) {
       ? { fileId: doc.file_id, mime: doc.mime_type }
       : "too_large";
   return null;
+}
+// Voice notes up to 5 minutes; transcription APIs accept far larger files.
+export const maxAudioBytes = 8 * 1024 * 1024;
+const maxAudioSeconds = 300;
+const audioTypes = /^audio\/(ogg|mpeg|mp4|m4a|x-m4a|wav|x-wav|webm|aac|opus)$/;
+export function messageAudio(message: TelegramMessage) {
+  const audio = message.voice ?? message.audio;
+  if (!audio) return null;
+  const mime = audio.mime_type || "audio/ogg";
+  if (!audioTypes.test(mime)) return null;
+  return audio.duration > maxAudioSeconds ||
+    (audio.file_size ?? 0) > maxAudioBytes
+    ? "too_large"
+    : { fileId: audio.file_id, mime };
 }
 export function telegramMode() {
   const mode = process.env.TELEGRAM_MODE;
@@ -180,6 +204,8 @@ export async function ingestUpdates(
       continue;
     const receivedAt = new Date(Math.min(message.date * 1000, now.getTime()));
     const image = messageImage(message);
+    const audio = image ? null : messageAudio(message);
+    const media = image ?? audio;
     const result = await database.inboxMessage.createMany({
       data: {
         id: inboxId(message.chat.id, message.message_id),
@@ -192,11 +218,13 @@ export async function ingestUpdates(
             ? message.text
             : image === "too_large"
               ? "[IMAGE_TOO_LARGE]"
-              : image
-                ? (message.caption ?? "")
-                : "[UNSUPPORTED_MEDIA]",
-        ...(image && image !== "too_large"
-          ? { fileId: image.fileId, fileMime: image.mime }
+              : audio === "too_large"
+                ? "[AUDIO_TOO_LONG]"
+                : media
+                  ? (message.caption ?? "")
+                  : "[UNSUPPORTED_MEDIA]",
+        ...(media && media !== "too_large"
+          ? { fileId: media.fileId, fileMime: media.mime }
           : {}),
       },
       skipDuplicates: true,
@@ -264,12 +292,19 @@ async function call(
 export async function downloadTelegramImage(
   fileId: string,
   transport: typeof fetch = fetch,
+) {
+  return downloadTelegramFile(fileId, transport, maxImageBytes);
+}
+export async function downloadTelegramFile(
+  fileId: string,
+  transport: typeof fetch = fetch,
+  maxBytes = maxImageBytes,
 ): Promise<Buffer> {
   if (!configured("TELEGRAM_BOT_TOKEN"))
     throw new AppError("TELEGRAM_NOT_CONFIGURED", 503);
   const started = Date.now();
   try {
-    return await downloadOnce(fileId, transport);
+    return await downloadOnce(fileId, transport, maxBytes);
   } catch (error) {
     // Telegram's file servers occasionally stall; retry once if time allows.
     if (
@@ -278,16 +313,20 @@ export async function downloadTelegramImage(
       Date.now() - started > 12000
     )
       throw error;
-    return downloadOnce(fileId, transport);
+    return downloadOnce(fileId, transport, maxBytes);
   }
 }
 const fileUnavailable = () =>
   new AppError(
     "TELEGRAM_FILE_UNAVAILABLE",
     503,
-    "Aku belum berhasil mengambil fotonya dari Telegram. Coba kirim ulang fotonya, ya. Belum ada yang aku simpan.",
+    "Aku belum berhasil mengambil filenya dari Telegram. Coba kirim ulang, ya. Belum ada yang aku simpan.",
   );
-async function downloadOnce(fileId: string, transport: typeof fetch) {
+async function downloadOnce(
+  fileId: string,
+  transport: typeof fetch,
+  maxBytes: number,
+) {
   let path: string;
   try {
     const response = await call(
@@ -306,11 +345,11 @@ async function downloadOnce(fileId: string, transport: typeof fetch) {
       })
       .safeParse(await response.json().catch(() => null));
     if (!response.ok || !parsed.success) throw new Error("TELEGRAM_FILE");
-    if ((parsed.data.result.file_size ?? 0) > maxImageBytes)
+    if ((parsed.data.result.file_size ?? 0) > maxBytes)
       throw new AppError(
         "IMAGE_TOO_LARGE",
         413,
-        "Fotonya terlalu besar buat aku baca (maks. 4 MB). Coba kirim sebagai foto biasa, ya.",
+        "Filenya terlalu besar buat aku proses. Coba kirim yang lebih kecil, ya.",
       );
     path = parsed.data.result.file_path;
   } catch (error) {
@@ -328,11 +367,11 @@ async function downloadOnce(fileId: string, transport: typeof fetch) {
   } catch {
     throw fileUnavailable();
   }
-  if (bytes.byteLength > maxImageBytes)
+  if (bytes.byteLength > maxBytes)
     throw new AppError(
       "IMAGE_TOO_LARGE",
       413,
-      "Fotonya terlalu besar buat aku baca (maks. 4 MB). Coba kirim sebagai foto biasa, ya.",
+      "Filenya terlalu besar buat aku proses. Coba kirim yang lebih kecil, ya.",
     );
   return Buffer.from(bytes);
 }
